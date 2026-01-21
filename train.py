@@ -327,6 +327,11 @@ def main() -> None:
         else f"{args.dataset}_nca_c{args.channel_n}_s{args.steps_min}-{args.steps_max}"
     )
     exp_dir = Path("runs") / exp_name
+    if exp_dir.exists():
+        suffix = 1
+        while (exp_dir.parent / f"{exp_name}_{suffix}").exists():
+            suffix += 1
+        exp_dir = exp_dir.parent / f"{exp_name}_{suffix}"
     exp_dir.mkdir(parents=True, exist_ok=True)
     metrics_file = exp_dir / "metrics.json"
     checkpoints_dir = exp_dir

@@ -125,6 +125,32 @@ def _resolve_monuseg_root(root: Optional[Path]) -> Path:
     )
 
 
+def _split_cases(
+    items: Sequence[Path], val_ratio: float, test_ratio: float
+) -> Dict[str, List[Path]]:
+    if not items:
+        raise RuntimeError("No samples available to split.")
+    items = sorted(items)
+    total = len(items)
+    val_count = int(total * val_ratio) if val_ratio > 0 else 0
+    test_count = int(total * test_ratio) if test_ratio > 0 else 0
+    if val_count + test_count >= total:
+        remaining = max(total - 2, 1)
+        val_count = min(val_count, remaining)
+        test_count = min(test_count, remaining - val_count)
+    train_count = total - val_count - test_count
+    if train_count <= 0:
+        train_count = max(1, total - (val_count + test_count))
+    start_val = train_count
+    start_test = start_val + val_count
+    splits = {
+        "train": list(items[:train_count]) or [items[0]],
+        "val": list(items[start_val:start_test]) or [items[min(start_val, total - 1)]],
+        "test": list(items[start_test:]) or [items[-1]],
+    }
+    return splits
+
+
 def _list_image_files(directory: Path) -> Dict[str, Path]:
     files: Dict[str, Path] = {}
     for path in directory.iterdir():
@@ -333,6 +359,7 @@ class DSB2018Dataset(Dataset):
         image_size: Optional[Tuple[int, int]] = None,
         augment: bool = False,
         val_ratio: float = 0.1,
+        test_ratio: float = 0.1,
     ) -> None:
         dsb_root = _resolve_dsb_root(root)
         train_root = dsb_root / "stage1_train"
@@ -340,15 +367,13 @@ class DSB2018Dataset(Dataset):
         case_dirs = sorted([p for p in train_root.iterdir() if p.is_dir()])
         if not case_dirs:
             raise RuntimeError(f"No case folders found under {train_root}")
-        split_idx = max(1, int(len(case_dirs) * (1 - val_ratio)))
-        if split.lower() == "train":
-            selected = case_dirs[:split_idx]
-        elif split.lower() == "val":
-            selected = case_dirs[split_idx:]
-        else:
-            raise ValueError("split must be 'train' or 'val'")
+        splits = _split_cases(case_dirs, val_ratio=val_ratio, test_ratio=test_ratio)
+        split_key = split.lower()
+        if split_key not in splits:
+            raise ValueError("split must be 'train', 'val', or 'test'")
+        selected = splits[split_key]
         if not selected:
-            raise RuntimeError(f"No samples for DSB2018 {split} split. Adjust val_ratio.")
+            raise RuntimeError(f"No samples for DSB2018 {split} split. Adjust ratios.")
         self.cases = selected
         self.image_size = image_size
         self.augment = augment
@@ -398,24 +423,23 @@ class MoNuSegDataset(Dataset):
         image_size: Optional[Tuple[int, int]] = None,
         augment: bool = False,
         val_ratio: float = 0.2,
+        test_ratio: float = 0.1,
     ) -> None:
         monu_root = _resolve_monuseg_root(root)
         images_dir = monu_root / "Tissue Images"
         ann_dir = monu_root / "Annotations"
         _ensure_exists(images_dir, "MoNuSeg tissue images directory")
         _ensure_exists(ann_dir, "MoNuSeg annotations directory")
-        samples = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in {".tif", ".tiff", ".png", ".jpg"}])
+        samples = [p for p in images_dir.iterdir() if p.suffix.lower() in {".tif", ".tiff", ".png", ".jpg"}]
         if not samples:
             raise RuntimeError(f"No MoNuSeg images found in {images_dir}")
-        split_idx = max(1, int(len(samples) * (1 - val_ratio)))
-        if split.lower() == "train":
-            selected = samples[:split_idx]
-        elif split.lower() == "val":
-            selected = samples[split_idx:]
-        else:
-            raise ValueError("split must be 'train' or 'val'")
+        splits = _split_cases(samples, val_ratio=val_ratio, test_ratio=test_ratio)
+        split_key = split.lower()
+        if split_key not in splits:
+            raise ValueError("split must be 'train', 'val', or 'test'")
+        selected = splits[split_key]
         if not selected:
-            raise RuntimeError(f"No MoNuSeg samples for split {split}. Adjust val_ratio.")
+            raise RuntimeError(f"No MoNuSeg samples for split {split}. Adjust ratios.")
         self.samples = selected
         self.ann_dir = ann_dir
         self.image_size = image_size
@@ -458,6 +482,60 @@ def _maybe_subset(dataset: Dataset, subset_size: Optional[int]) -> Dataset:
     return Subset(dataset, indices)
 
 
+def build_dataset(
+    dataset_name: str,
+    split: str,
+    image_size: Optional[Tuple[int, int]],
+    augment: bool,
+    root: Optional[str],
+    ignore_index: int,
+) -> Tuple[Dataset, int, List[str]]:
+    dataset_name = dataset_name.lower()
+    split = split.lower()
+    root_path = Path(root) if root else None
+    if dataset_name == "voc":
+        if split not in {"train", "val"}:
+            raise ValueError("VOC supports 'train' and 'val' splits.")
+        dataset = VOCSegmentationDataset(
+            root=root_path, split=split, image_size=image_size, augment=augment
+        )
+    elif dataset_name == "camvid":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("CamVid supports 'train', 'val', or 'test' splits.")
+        dataset = CamVidDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+            ignore_index=ignore_index,
+        )
+    elif dataset_name == "dsb2018":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("DSB2018 supports 'train', 'val', or 'test' splits.")
+        dataset = DSB2018Dataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "monuseg":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("MoNuSeg supports 'train', 'val', or 'test' splits.")
+        dataset = MoNuSegDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    else:
+        raise ValueError(f"Unsupported dataset '{dataset_name}'.")
+    num_classes = getattr(dataset, "num_classes", None)
+    class_names = getattr(dataset, "class_names", None)
+    if num_classes is None or class_names is None:
+        raise RuntimeError(f"Dataset {dataset_name} must define num_classes and class_names.")
+    return dataset, num_classes, class_names
+
+
 def build_dataloaders(
     dataset_name: str,
     batch_size: int,
@@ -469,66 +547,22 @@ def build_dataloaders(
     train_subset: Optional[int] = None,
     val_subset: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, int, List[str]]:
-    dataset_name = dataset_name.lower()
-    root_path = Path(root) if root else None
-    if dataset_name == "voc":
-        train_dataset = VOCSegmentationDataset(
-            root=root_path, split="train", image_size=image_size, augment=True
-        )
-        val_dataset = VOCSegmentationDataset(
-            root=root_path, split="val", image_size=image_size, augment=False
-        )
-        num_classes = train_dataset.num_classes
-        class_names = train_dataset.class_names
-    elif dataset_name == "camvid":
-        train_dataset = CamVidDataset(
-            root=root_path,
-            split="train",
-            image_size=image_size,
-            augment=True,
-            ignore_index=ignore_index,
-        )
-        val_dataset = CamVidDataset(
-            root=root_path,
-            split="val",
-            image_size=image_size,
-            augment=False,
-            ignore_index=ignore_index,
-        )
-        num_classes = train_dataset.num_classes
-        class_names = train_dataset.class_names
-    elif dataset_name == "dsb2018":
-        train_dataset = DSB2018Dataset(
-            root=root_path,
-            split="train",
-            image_size=image_size,
-            augment=True,
-        )
-        val_dataset = DSB2018Dataset(
-            root=root_path,
-            split="val",
-            image_size=image_size,
-            augment=False,
-        )
-        num_classes = train_dataset.num_classes
-        class_names = train_dataset.class_names
-    elif dataset_name == "monuseg":
-        train_dataset = MoNuSegDataset(
-            root=root_path,
-            split="train",
-            image_size=image_size,
-            augment=True,
-        )
-        val_dataset = MoNuSegDataset(
-            root=root_path,
-            split="val",
-            image_size=image_size,
-            augment=False,
-        )
-        num_classes = train_dataset.num_classes
-        class_names = train_dataset.class_names
-    else:
-        raise ValueError(f"Unsupported dataset '{dataset_name}'.")
+    train_dataset, num_classes, class_names = build_dataset(
+        dataset_name=dataset_name,
+        split="train",
+        image_size=image_size,
+        augment=True,
+        root=root,
+        ignore_index=ignore_index,
+    )
+    val_dataset, _, _ = build_dataset(
+        dataset_name=dataset_name,
+        split="val",
+        image_size=image_size,
+        augment=False,
+        root=root,
+        ignore_index=ignore_index,
+    )
 
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise RuntimeError(f"{dataset_name} dataset is empty. Please verify the data root.")
@@ -550,3 +584,34 @@ def build_dataloaders(
         drop_last=False,
     )
     return train_loader, val_loader, num_classes, class_names
+
+
+def build_split_dataloader(
+    dataset_name: str,
+    split: str,
+    batch_size: int,
+    image_size: Optional[Tuple[int, int]],
+    num_workers: int,
+    pin_memory: bool,
+    root: Optional[str],
+    ignore_index: int,
+    subset: Optional[int] = None,
+    shuffle: bool = False,
+) -> Tuple[DataLoader, int, List[str]]:
+    dataset, num_classes, class_names = build_dataset(
+        dataset_name=dataset_name,
+        split=split,
+        image_size=image_size,
+        augment=shuffle,
+        root=root,
+        ignore_index=ignore_index,
+    )
+    loader = DataLoader(
+        _maybe_subset(dataset, subset),
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+    return loader, num_classes, class_names
