@@ -24,6 +24,11 @@ DATASET_DEFAULT_ROOTS = {
         "datasets/MoNuSeg/MoNuSeg 2018 Training Data",
         "datasets/MoNuSeg",
     ],
+    "rus": [
+        "datasets/US/RUS",
+        "datasets/us/RUS",
+        "datasets/US/abdominal_US/abdominal_US/RUS",
+    ],
 }
 
 
@@ -31,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train an NCA model for segmentation.")
     parser.add_argument(
         "--dataset",
-        choices=["voc", "camvid", "dsb2018", "monuseg"],
+        choices=["voc", "camvid", "dsb2018", "monuseg", "rus"],
         required=True,
         help="Dataset to use.",
     )

@@ -8,12 +8,48 @@ from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageDraw, ImageOps, ImageEnhance, ImageChops, ImageFilter
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 import torchvision.transforms.functional as TF
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+_AUGMENT_SEED = 1337
+
+
+def _apply_image_translation(image: Image.Image, dx: int, dy: int, fill) -> Image.Image:
+    canvas = Image.new(image.mode, image.size, fill)
+    canvas.paste(image, (dx, dy))
+    return canvas
+
+
+def _augment_image_and_mask(image: Image.Image, mask: Image.Image, rng: random.Random) -> Tuple[Image.Image, Image.Image]:
+    angle = rng.uniform(-12.0, 12.0)
+    image = image.rotate(angle, resample=Image.BILINEAR)
+    mask = mask.rotate(angle, resample=Image.NEAREST)
+    if rng.random() < 0.5:
+        image = ImageOps.mirror(image)
+        mask = ImageOps.mirror(mask)
+    dx = rng.randint(-16, 16)
+    dy = rng.randint(-16, 16)
+    image = _apply_image_translation(image, dx, dy, fill=(0, 0, 0))
+    mask = _apply_image_translation(mask, dx, dy, fill=0)
+
+    image = ImageEnhance.Brightness(image).enhance(rng.uniform(0.8, 1.2))
+    image = ImageEnhance.Contrast(image).enhance(rng.uniform(0.8, 1.2))
+    image = ImageEnhance.Color(image).enhance(rng.uniform(0.8, 1.2))
+
+    if rng.random() < 0.3:
+        image = image.filter(ImageFilter.GaussianBlur(radius=1.2))
+
+    arr = np.array(image).astype(np.float32) / 255.0
+    noise = np.random.default_rng(rng.randint(0, 2**32 - 1)).normal(0.0, 0.03, arr.shape)
+    arr = np.clip(arr + noise, 0.0, 1.0)
+    image = Image.fromarray((arr * 255).astype(np.uint8))
+
+    mask = (np.array(mask) > 0).astype(np.uint8)
+    mask_img = Image.fromarray(mask * 255, mode="L")
+    return image, mask_img
 
 VOC_CLASS_NAMES = [
     "background",
@@ -114,14 +150,41 @@ def _resolve_monuseg_root(root: Optional[Path]) -> Path:
         )
     for candidate in candidates:
         candidate = candidate.expanduser().resolve()
-        if (candidate / "Tissue Images").exists() and (candidate / "Annotations").exists():
-            if (candidate / "Tissue Images").is_dir():
-                return candidate
-            if (candidate.parent / "Tissue Images").exists():
-                return candidate.parent
+        possible = [candidate]
+        nested = candidate / "MoNuSeg 2018 Training Data"
+        if nested.exists():
+            possible.append(nested)
+        for root_candidate in possible:
+            splits_dir = root_candidate / "splits"
+            if (splits_dir / "train" / "images").exists() and (
+                splits_dir / "train" / "annotations"
+            ).exists():
+                return root_candidate
     raise FileNotFoundError(
-        "Unable to locate MoNuSeg dataset root. Expected 'Tissue Images' and "
-        "'Annotations' directories under datasets/MoNuSeg."
+        "Unable to locate MoNuSeg dataset root with precomputed splits. "
+        "Expected directories like datasets/MoNuSeg/.../splits/train/images."
+    )
+
+
+def _resolve_rus_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/US/RUS"),
+            Path("datasets/us/RUS"),
+            Path("datasets/US/abdominal_US/abdominal_US/RUS"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        images_dir = candidate / "images"
+        ann_dir = candidate / "annotations"
+        if images_dir.exists() and ann_dir.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate the RUS ultrasound dataset root. "
+        "Expected directories like datasets/US/RUS with images/ and annotations/."
     )
 
 
@@ -149,6 +212,96 @@ def _split_cases(
         "test": list(items[start_test:]) or [items[-1]],
     }
     return splits
+
+
+def _load_dsb_case_mask(case_dir: Path, size: Tuple[int, int]) -> Image.Image:
+    mask_dir = case_dir / "masks"
+    mask = Image.new("L", size, 0)
+    for mask_path in mask_dir.iterdir():
+        if mask_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        mask_img = Image.open(mask_path).convert("L").resize(size, Image.NEAREST)
+        mask_arr = (np.array(mask_img) > 0).astype(np.uint8)
+        mask_base = np.array(mask)
+        mask = Image.fromarray(np.maximum(mask_base, mask_arr * 255).astype(np.uint8))
+    return mask
+
+
+def _ensure_dsb_augmented_split(
+    train_root: Path, split: str, selected_cases: List[Path]
+) -> List[Path]:
+    aug_root = train_root / "augmented" / split
+    aug_root.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(_AUGMENT_SEED)
+    aug_cases: List[Path] = []
+    for case_dir in selected_cases:
+        dest_dir = aug_root / case_dir.name
+        image_dest = dest_dir / "images"
+        mask_dest = dest_dir / "masks"
+        if not (image_dest / f"{case_dir.name}.png").exists():
+            image_dest.mkdir(parents=True, exist_ok=True)
+            mask_dest.mkdir(parents=True, exist_ok=True)
+            image_files = sorted((case_dir / "images").glob("*"))
+            if not image_files:
+                continue
+            image = Image.open(image_files[0]).convert("RGB")
+            mask = _load_dsb_case_mask(case_dir, image.size)
+            case_rng = random.Random(rng.randint(0, 2**32 - 1))
+            image_aug, mask_aug = _augment_image_and_mask(image, mask, case_rng)
+            image_aug.save(image_dest / f"{case_dir.name}.png")
+            mask_aug.save(mask_dest / "mask.png")
+        aug_cases.append(dest_dir)
+    return aug_cases
+
+
+def _rasterize_monuseg_mask(xml_path: Path, size: Tuple[int, int]) -> Image.Image:
+    xml_root = ET.parse(xml_path).getroot()
+    mask = Image.new("L", size, 0)
+    draw = ImageDraw.Draw(mask)
+    for region in xml_root.findall(".//Region"):
+        vertices = region.find("Vertices")
+        if vertices is None:
+            continue
+        points = [
+            (float(vertex.attrib["X"]), float(vertex.attrib["Y"]))
+            for vertex in vertices
+            if "X" in vertex.attrib and "Y" in vertex.attrib
+        ]
+        if len(points) >= 3:
+            draw.polygon(points, outline=1, fill=1)
+    return mask
+
+
+def _ensure_monuseg_augmented_split(root: Path, split: str) -> Tuple[Path, Path]:
+    base_dir = root / "splits" / split
+    images_dir = base_dir / "images"
+    ann_dir = base_dir / "annotations"
+    if not images_dir.exists() or not ann_dir.exists():
+        raise FileNotFoundError(f"MoNuSeg split '{split}' not found at {base_dir}")
+    aug_dir = root / "splits_aug" / split
+    aug_img_dir = aug_dir / "images"
+    aug_ann_dir = aug_dir / "annotations"
+    aug_img_dir.mkdir(parents=True, exist_ok=True)
+    aug_ann_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(_AUGMENT_SEED)
+    for image_path in sorted(images_dir.iterdir()):
+        if image_path.suffix.lower() not in IMAGE_EXTENSIONS:
+            continue
+        stem = image_path.stem
+        dest_img = aug_img_dir / f"{stem}.png"
+        dest_mask = aug_ann_dir / f"{stem}.png"
+        if dest_img.exists() and dest_mask.exists():
+            continue
+        image = Image.open(image_path).convert("RGB")
+        mask_path = ann_dir / f"{stem}.xml"
+        if not mask_path.exists():
+            continue
+        mask = _rasterize_monuseg_mask(mask_path, image.size)
+        case_rng = random.Random(rng.randint(0, 2**32 - 1))
+        image_aug, mask_aug = _augment_image_and_mask(image, mask, case_rng)
+        image_aug.save(dest_img)
+        mask_aug.save(dest_mask)
+    return aug_img_dir, aug_ann_dir
 
 
 def _list_image_files(directory: Path) -> Dict[str, Path]:
@@ -369,12 +522,19 @@ class DSB2018Dataset(Dataset):
             raise RuntimeError(f"No case folders found under {train_root}")
         splits = _split_cases(case_dirs, val_ratio=val_ratio, test_ratio=test_ratio)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in splits:
-            raise ValueError("split must be 'train', 'val', or 'test'")
+            raise ValueError("split must be 'train', 'val', 'test', or *_aug")
         selected = splits[split_key]
         if not selected:
-            raise RuntimeError(f"No samples for DSB2018 {split} split. Adjust ratios.")
-        self.cases = selected
+            raise RuntimeError(f"No samples for DSB2018 {split_key} split. Adjust ratios.")
+        if augmented:
+            self.cases = _ensure_dsb_augmented_split(train_root, split_key, selected)
+        else:
+            self.cases = selected
         self.image_size = image_size
         self.augment = augment
 
@@ -422,25 +582,30 @@ class MoNuSegDataset(Dataset):
         split: str,
         image_size: Optional[Tuple[int, int]] = None,
         augment: bool = False,
-        val_ratio: float = 0.2,
-        test_ratio: float = 0.1,
     ) -> None:
         monu_root = _resolve_monuseg_root(root)
-        images_dir = monu_root / "Tissue Images"
-        ann_dir = monu_root / "Annotations"
-        _ensure_exists(images_dir, "MoNuSeg tissue images directory")
-        _ensure_exists(ann_dir, "MoNuSeg annotations directory")
-        samples = [p for p in images_dir.iterdir() if p.suffix.lower() in {".tif", ".tiff", ".png", ".jpg"}]
-        if not samples:
-            raise RuntimeError(f"No MoNuSeg images found in {images_dir}")
-        splits = _split_cases(samples, val_ratio=val_ratio, test_ratio=test_ratio)
         split_key = split.lower()
-        if split_key not in splits:
-            raise ValueError("split must be 'train', 'val', or 'test'")
-        selected = splits[split_key]
-        if not selected:
-            raise RuntimeError(f"No MoNuSeg samples for split {split}. Adjust ratios.")
-        self.samples = selected
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
+        if augmented:
+            images_dir, ann_dir = _ensure_monuseg_augmented_split(monu_root, split_key)
+        else:
+            split_dir = monu_root / "splits" / split_key
+            images_dir = split_dir / "images"
+            ann_dir = split_dir / "annotations"
+            _ensure_exists(images_dir, f"MoNuSeg split images directory for {split_key}")
+            _ensure_exists(ann_dir, f"MoNuSeg split annotations directory for {split_key}")
+        samples = sorted(
+            [p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS]
+        )
+        if not samples:
+            raise RuntimeError(
+                f"No MoNuSeg samples found in {images_dir}. "
+                "Run split_monuseg.py to generate splits."
+            )
+        self.samples = samples
         self.ann_dir = ann_dir
         self.image_size = image_size
         self.augment = augment
@@ -449,30 +614,60 @@ class MoNuSegDataset(Dataset):
         return len(self.samples)
 
     def _load_mask(self, image_path: Path, size: Tuple[int, int]) -> Image.Image:
-        ann_name = image_path.stem + ".xml"
-        ann_path = self.ann_dir / ann_name
-        _ensure_exists(ann_path, f"MoNuSeg annotation for {image_path.name}")
-        xml_root = ET.parse(ann_path).getroot()
-        mask = Image.new("L", size, 0)
-        draw = ImageDraw.Draw(mask)
-        for region in xml_root.findall(".//Region"):
-            vertices = region.find("Vertices")
-            if vertices is None:
-                continue
-            coords = [
-                (float(vertex.attrib["X"]), float(vertex.attrib["Y"]))
-                for vertex in vertices
-                if "X" in vertex.attrib and "Y" in vertex.attrib
-            ]
-            if len(coords) >= 3:
-                draw.polygon(coords, outline=1, fill=1)
-        return mask
+        base_name = image_path.stem
+        ann_xml = self.ann_dir / f"{base_name}.xml"
+        if ann_xml.exists():
+            return _rasterize_monuseg_mask(ann_xml, size)
+        ann_png = self.ann_dir / f"{base_name}.png"
+        if ann_png.exists():
+            return Image.open(ann_png).convert("L").resize(size, Image.NEAREST)
+        raise FileNotFoundError(f"Annotation for {image_path.name} not found in {self.ann_dir}")
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         image_path = self.samples[idx]
         image = Image.open(image_path).convert("RGB")
         mask = self._load_mask(image_path, image.size)
         return _apply_shared_transforms(image, mask, self.image_size, self.augment)
+
+
+class RUSDataset(Dataset):
+    class_names = ["background", "organ"]
+    num_classes = 2
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        rus_root = _resolve_rus_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("RUS supports 'train', 'val', or 'test' splits.")
+        images_dir = rus_root / "images" / split_key
+        ann_dir = rus_root / "annotations" / split_key
+        _ensure_exists(images_dir, f"RUS images directory for split '{split_key}'")
+        _ensure_exists(ann_dir, f"RUS annotations directory for split '{split_key}'")
+        samples = _match_image_label_paths(images_dir, ann_dir)
+        if not samples:
+            raise RuntimeError(
+                f"No overlapping image/mask files found for RUS split '{split_key}'."
+            )
+        self.samples = samples
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
 
 
 def _maybe_subset(dataset: Dataset, subset_size: Optional[int]) -> Dataset:
@@ -510,8 +705,9 @@ def build_dataset(
             ignore_index=ignore_index,
         )
     elif dataset_name == "dsb2018":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("DSB2018 supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("DSB2018 supports 'train', 'val', 'test', or *_aug splits.")
         dataset = DSB2018Dataset(
             root=root_path,
             split=split,
@@ -519,9 +715,19 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "monuseg":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("MoNuSeg supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("MoNuSeg supports 'train', 'val', 'test', or *_aug splits.")
         dataset = MoNuSegDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "rus":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("RUS supports 'train', 'val', or 'test' splits.")
+        dataset = RUSDataset(
             root=root_path,
             split=split,
             image_size=image_size,
