@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import random
+from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+from PIL import Image
 import torch
 from torch.utils.data import Subset
 
@@ -34,8 +36,8 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         type=str,
         nargs="+",
-        default=["dsb2018", "monuseg", "rus"],
-        help="Datasets to evaluate (default: dsb2018 monuseg rus).",
+        default=["dsb2018", "monuseg", "rus", "nuinsseg", "isic2017"],
+        help="Datasets to evaluate (default: dsb2018 monuseg rus nuinsseg isic2017).",
     )
     parser.add_argument("--split", type=str, default="test", help="Split to evaluate.")
     parser.add_argument(
@@ -83,6 +85,37 @@ def dice_coefficient(target: np.ndarray, pred: np.ndarray) -> float:
     return (2 * intersection) / total if total > 0 else 1.0
 
 
+def compute_annotator_disagreement(
+    mask_paths: List[str], target_size: Tuple[int, int]
+) -> Optional[Dict[str, float]]:
+    if not mask_paths:
+        return None
+    masks: List[np.ndarray] = []
+    width, height = target_size
+    for path in mask_paths:
+        mask_img = Image.open(path).convert("L").resize((width, height), Image.NEAREST)
+        mask_arr = (np.array(mask_img, dtype=np.uint8) > 0).astype(np.float32)
+        masks.append(mask_arr)
+    if not masks:
+        return None
+    stack = np.stack(masks, axis=0)
+    prob = stack.mean(axis=0)
+    variance = prob * (1.0 - prob)
+    stats: Dict[str, float] = {
+        "annotator_variance_mean": float(variance.mean()),
+        "annotator_variance_max": float(variance.max()),
+    }
+    if stack.shape[0] >= 2:
+        pairwise = []
+        for a, b in combinations(stack, 2):
+            dice = dice_coefficient(a, b)
+            pairwise.append(dice)
+        pairwise = np.array(pairwise, dtype=np.float32)
+        stats["annotator_pairwise_dice_mean"] = float(pairwise.mean())
+        stats["annotator_pairwise_dice_std"] = float(pairwise.std())
+    return stats
+
+
 def unwrap_dataset(dataset):
     indices = None
     current = dataset
@@ -127,6 +160,10 @@ def get_sample_metadata(dataset, index: int) -> Dict[str, Optional[str]]:
         }
         if mask_path is not None:
             meta["mask_path"] = str(mask_path)
+        if hasattr(dataset, "multi_mask_paths"):
+            extra = dataset.multi_mask_paths[index]
+            if extra:
+                meta["multi_mask_paths"] = [str(path) for path in extra]
         return meta
     if hasattr(dataset, "cases"):
         case_dir = Path(dataset.cases[index])
@@ -210,15 +247,21 @@ def generate_quality_labels(
                 bad = float(dice < args.iou_threshold)
                 global_index = batch_idx * args.batch_size + i
                 meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
-                records.append(
-                    {
-                        "index": global_index,
-                        "dice": dice,
-                        "boundary_f1": boundary,
-                        "bad_label": bad,
-                        **meta,
-                    }
-                )
+                record = {
+                    "index": global_index,
+                    "dice": dice,
+                    "boundary_f1": boundary,
+                    "bad_label": bad,
+                    **meta,
+                }
+                extra_masks = meta.get("multi_mask_paths")
+                if extra_masks:
+                    stats = compute_annotator_disagreement(
+                        extra_masks, (target_clean.shape[1], target_clean.shape[0])
+                    )
+                    if stats:
+                        record.update(stats)
+                records.append(record)
 
     output_dir = checkpoint_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)

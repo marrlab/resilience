@@ -31,6 +31,14 @@ DATASET_DEFAULT_ROOTS = {
         "datasets/us/RUS",
         "datasets/US/abdominal_US/abdominal_US/RUS",
     ],
+    "nuinsseg": [
+        "datasets/NuInsSeg",
+        "datasets/nuinsseg",
+    ],
+    "isic2017": [
+        "datasets/isic/isic2017_task1",
+        "datasets/isic2017_task1",
+    ],
 }
 
 
@@ -39,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint.")
     parser.add_argument(
         "--dataset",
-        choices=["voc", "camvid", "dsb2018", "monuseg", "rus"],
+        choices=["voc", "camvid", "dsb2018", "monuseg", "rus", "nuinsseg", "isic2017"],
         required=True,
         help="Dataset name.",
     )

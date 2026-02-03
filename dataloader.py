@@ -188,6 +188,49 @@ def _resolve_rus_root(root: Optional[Path]) -> Path:
     )
 
 
+def _resolve_nuinsseg_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/NuInsSeg"),
+            Path("datasets/nuinsseg"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        splits_dir = candidate / "splits"
+        if (splits_dir / "train" / "images").exists() and (
+            splits_dir / "train" / "annotations"
+        ).exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate NuInsSeg splits. "
+        "Run datasets/NuInsSeg/split_nuinsseg.py to create train/val/test folders."
+    )
+
+
+def _resolve_isic_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/isic/isic2017_task1"),
+            Path("datasets/isic2017_task1"),
+            Path("datasets/isic"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        train_dir = candidate / "ISIC-2017_Training_Data"
+        if train_dir.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate ISIC 2017 dataset root. "
+        "Expected directories like datasets/isic/isic2017_task1 with ISIC-2017_Training_Data."
+    )
+
+
 def _split_cases(
     items: Sequence[Path], val_ratio: float, test_ratio: float
 ) -> Dict[str, List[Path]]:
@@ -299,6 +342,36 @@ def _ensure_monuseg_augmented_split(root: Path, split: str) -> Tuple[Path, Path]
         mask = _rasterize_monuseg_mask(mask_path, image.size)
         case_rng = random.Random(rng.randint(0, 2**32 - 1))
         image_aug, mask_aug = _augment_image_and_mask(image, mask, case_rng)
+        image_aug.save(dest_img)
+        mask_aug.save(dest_mask)
+    return aug_img_dir, aug_ann_dir
+
+
+def _ensure_nuinsseg_augmented_split(root: Path, split: str) -> Tuple[Path, Path]:
+    base_dir = root / "splits" / split
+    images_dir = base_dir / "images"
+    ann_dir = base_dir / "annotations"
+    _ensure_exists(images_dir, f"NuInsSeg split images directory for {split}")
+    _ensure_exists(ann_dir, f"NuInsSeg split annotations directory for {split}")
+    aug_dir = root / "splits_aug" / split
+    aug_img_dir = aug_dir / "images"
+    aug_ann_dir = aug_dir / "annotations"
+    aug_img_dir.mkdir(parents=True, exist_ok=True)
+    aug_ann_dir.mkdir(parents=True, exist_ok=True)
+    rng = random.Random(_AUGMENT_SEED)
+    pairs = _match_image_label_paths(images_dir, ann_dir)
+    for image_path, mask_path in pairs:
+        stem = image_path.stem
+        dest_img = aug_img_dir / f"{stem}.png"
+        dest_mask = aug_ann_dir / f"{stem}.png"
+        if dest_img.exists() and dest_mask.exists():
+            continue
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        bin_mask = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(bin_mask * 255, mode="L")
+        case_rng = random.Random(rng.randint(0, 2**32 - 1))
+        image_aug, mask_aug = _augment_image_and_mask(image, mask_img, case_rng)
         image_aug.save(dest_img)
         mask_aug.save(dest_mask)
     return aug_img_dir, aug_ann_dir
@@ -665,7 +738,113 @@ class RUSDataset(Dataset):
         image_path, mask_path = self.samples[idx]
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
-        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8) * 255
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
+
+
+class NuInsSegDataset(Dataset):
+    class_names = ["background", "nucleus"]
+    num_classes = 2
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        nuinsseg_root = _resolve_nuinsseg_root(root)
+        split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("NuInsSeg supports 'train', 'val', 'test', or *_aug splits.")
+        if augmented:
+            images_dir, ann_dir = _ensure_nuinsseg_augmented_split(nuinsseg_root, split_key)
+        else:
+            split_dir = nuinsseg_root / "splits" / split_key
+            images_dir = split_dir / "images"
+            ann_dir = split_dir / "annotations"
+            _ensure_exists(images_dir, f"NuInsSeg images directory for split '{split_key}'")
+            _ensure_exists(ann_dir, f"NuInsSeg annotations directory for split '{split_key}'")
+        samples = _match_image_label_paths(images_dir, ann_dir)
+        self.samples = samples
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
+
+
+class ISIC2017Dataset(Dataset):
+    class_names = ["background", "lesion"]
+    num_classes = 2
+    _SPLIT_MAP = {"train": "Training", "val": "Validation", "test": "Test_v2"}
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        isic_root = _resolve_isic_root(root)
+        split_key = split.lower()
+        if split_key not in self._SPLIT_MAP:
+            raise ValueError("ISIC2017 supports 'train', 'val', or 'test' splits.")
+        split_name = self._SPLIT_MAP[split_key]
+        images_dir = isic_root / f"ISIC-2017_{split_name}_Data"
+        masks_dir = isic_root / f"ISIC-2017_{split_name}_Part1_GroundTruth"
+        _ensure_exists(images_dir, f"ISIC2017 images directory for {split_name}")
+        _ensure_exists(masks_dir, f"ISIC2017 masks directory for {split_name}")
+        multi_dirs = [
+            d
+            for d in sorted(isic_root.glob(f"ISIC-2017_{split_name}_Part1_GroundTruth*"))
+            if d.is_dir() and d != masks_dir and "Part2" not in d.name
+        ]
+        samples: List[Tuple[Path, Path]] = []
+        extra_masks: List[List[Path]] = []
+        for image_path in sorted(images_dir.iterdir()):
+            if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+                continue
+            if image_path.stem.endswith("_superpixels"):
+                continue
+            mask_path = masks_dir / f"{image_path.stem}_segmentation.png"
+            if not mask_path.exists():
+                continue
+            annot_masks: List[Path] = []
+            for multi_dir in multi_dirs:
+                candidate = multi_dir / f"{image_path.stem}_segmentation.png"
+                if candidate.exists():
+                    annot_masks.append(candidate)
+            samples.append((image_path, mask_path))
+            extra_masks.append(annot_masks)
+        if not samples:
+            raise RuntimeError(f"No ISIC2017 samples found in {images_dir}")
+        self.samples = samples
+        self.multi_mask_paths = extra_masks
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
         mask_img = Image.fromarray(mask_arr, mode="L")
         return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
 
@@ -728,6 +907,25 @@ def build_dataset(
         if split not in {"train", "val", "test"}:
             raise ValueError("RUS supports 'train', 'val', or 'test' splits.")
         dataset = RUSDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "nuinsseg":
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("NuInsSeg supports 'train', 'val', 'test', or *_aug splits.")
+        dataset = NuInsSegDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "isic2017":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("ISIC2017 supports 'train', 'val', or 'test' splits.")
+        dataset = ISIC2017Dataset(
             root=root_path,
             split=split,
             image_size=image_size,

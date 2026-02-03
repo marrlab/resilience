@@ -5,6 +5,7 @@ import json
 import math
 import random
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -34,7 +35,7 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         type=str,
         nargs="+",
-        default=["dsb2018", "monuseg", "rus"],
+        default=["dsb2018", "monuseg", "rus", "nuinsseg", "isic2017"],
         help="Datasets to process.",
     )
     parser.add_argument("--split", type=str, default="test")
@@ -82,6 +83,12 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=12,
         help="Number of relaxation steps for resilience uncertainty.",
+    )
+    parser.add_argument(
+        "--tta_max_transforms",
+        type=int,
+        default=None,
+        help="Limit number of geometric transforms used for TTA (default: use all).",
     )
     return parser.parse_args()
 
@@ -147,6 +154,10 @@ def get_sample_metadata(dataset, index: int) -> Dict[str, Optional[str]]:
         }
         if mask_path is not None:
             meta["mask_path"] = str(mask_path)
+        if hasattr(dataset, "multi_mask_paths"):
+            extra = dataset.multi_mask_paths[index]
+            if extra:
+                meta["multi_mask_paths"] = [str(path) for path in extra]
         return meta
     if hasattr(dataset, "cases"):
         case_dir = Path(dataset.cases[index])
@@ -200,6 +211,48 @@ def compute_entropy(probs: torch.Tensor) -> torch.Tensor:
     return -(p * torch.log(p)).sum(dim=1)
 
 
+@dataclass(frozen=True)
+class _TTATransform:
+    rotations: int = 0
+    flip_h: bool = False
+    flip_v: bool = False
+
+
+def _apply_tta_transform(tensor: torch.Tensor, transform: _TTATransform) -> torch.Tensor:
+    out = tensor
+    if transform.rotations:
+        out = torch.rot90(out, transform.rotations, dims=(-2, -1))
+    if transform.flip_h:
+        out = torch.flip(out, dims=(-1,))
+    if transform.flip_v:
+        out = torch.flip(out, dims=(-2,))
+    return out
+
+
+def _invert_tta_transform(tensor: torch.Tensor, transform: _TTATransform) -> torch.Tensor:
+    out = tensor
+    if transform.flip_v:
+        out = torch.flip(out, dims=(-2,))
+    if transform.flip_h:
+        out = torch.flip(out, dims=(-1,))
+    if transform.rotations:
+        out = torch.rot90(out, (4 - transform.rotations) % 4, dims=(-2, -1))
+    return out
+
+
+def _default_tta_transforms() -> List[_TTATransform]:
+    return [
+        _TTATransform(rotations=0, flip_h=False, flip_v=False),
+        _TTATransform(rotations=0, flip_h=True, flip_v=False),
+        _TTATransform(rotations=0, flip_h=False, flip_v=True),
+        _TTATransform(rotations=0, flip_h=True, flip_v=True),
+        _TTATransform(rotations=1, flip_h=False, flip_v=False),
+        _TTATransform(rotations=2, flip_h=False, flip_v=False),
+        _TTATransform(rotations=3, flip_h=False, flip_v=False),
+        _TTATransform(rotations=1, flip_h=True, flip_v=False),
+    ]
+
+
 def save_entropy_map(entropy: np.ndarray, path: Path, save_png: bool) -> None:
     np.save(path, entropy)
     if save_png:
@@ -243,16 +296,19 @@ def generate_uncertainty(
     sample_meta = [get_sample_metadata(base_dataset, idx) for idx in order]
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    model = BackboneNCA(
-        channel_n=channel_n,
-        fire_rate=fire_rate,
-        device=device,
-        hidden_size=hidden_size,
-        input_channels=input_channels,
-        steps_default=steps,
-    ).to(device)
-    model.load_state_dict(checkpoint["model_state"])
-    model.eval()
+    requires_model = method not in {"disagreement"}
+    model: Optional[BackboneNCA] = None
+    if requires_model:
+        model = BackboneNCA(
+            channel_n=channel_n,
+            fire_rate=fire_rate,
+            device=device,
+            hidden_size=hidden_size,
+            input_channels=input_channels,
+            steps_default=steps,
+        ).to(device)
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
 
     output_dir = (
         checkpoint_path.parent / f"uncertainty_{dataset}_{args.split}_{method}"
@@ -599,6 +655,152 @@ def generate_uncertainty(
                     np.save(output_dir / f"{sample_id}_resilience.npy", mask_a.astype(np.uint8))
                     np.save(output_dir / f"{sample_id}_pred.npy", mask_b)
                     np.save(output_dir / f"{sample_id}_prob.npy", prob_relaxed[i])
+                    record.update(meta)
+                    records.append(record)
+        elif method == "tta":
+            transforms = _default_tta_transforms()
+            if args.tta_max_transforms is not None:
+                limit = max(1, args.tta_max_transforms)
+                transforms = transforms[:limit]
+            if not transforms:
+                raise ValueError("TTA requires at least one transform.")
+            for batch_idx, (images, targets) in enumerate(loader):
+                images = images.to(device, non_blocking=True)
+                targets = sanitize_targets(
+                    targets.to(device, non_blocking=True), num_classes, args.ignore_index
+                )
+                aggregated_probs: List[torch.Tensor] = []
+                for transform in transforms:
+                    transformed = _apply_tta_transform(images, transform)
+                    state = prepare_state(transformed, channel_n)
+                    logits_state = model(state, steps=steps)
+                    logits = select_logits(logits_state, num_classes)
+                    probs = torch.softmax(logits, dim=1)
+                    probs = _invert_tta_transform(probs, transform)
+                    aggregated_probs.append(probs)
+                stacked = torch.stack(aggregated_probs, dim=0)
+                mean_probs = stacked.mean(dim=0)
+                var_probs = stacked.var(dim=0, unbiased=False)
+                entropy = compute_entropy(mean_probs).cpu().numpy()
+                pred_idx = torch.argmax(mean_probs, dim=1, keepdim=True)
+                preds = pred_idx.squeeze(1).cpu().numpy().astype(np.uint8)
+                if num_classes <= 1:
+                    prob_map = mean_probs[:, 0]
+                    variance_map = var_probs[:, 0]
+                elif num_classes == 2:
+                    prob_map = mean_probs[:, 1]
+                    variance_map = var_probs[:, 1]
+                else:
+                    prob_map = torch.gather(mean_probs, 1, pred_idx).squeeze(1)
+                    variance_map = torch.gather(var_probs, 1, pred_idx).squeeze(1)
+                prob_np = prob_map.cpu().numpy()
+                variance_np = variance_map.cpu().numpy()
+                for i in range(entropy.shape[0]):
+                    global_index = batch_idx * args.batch_size + i
+                    meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
+                    sample_id = meta.get("sample_id", f"sample_{global_index}")
+                    entropy_map = entropy[i]
+                    pred_mask = preds[i]
+                    prob_map_i = prob_np[i]
+                    variance_map_i = variance_np[i]
+                    entropy_path = output_dir / f"{sample_id}_tta_entropy.npy"
+                    save_entropy_map(entropy_map, entropy_path, args.save_png)
+                    pred_path = output_dir / f"{sample_id}_pred.npy"
+                    np.save(pred_path, pred_mask)
+                    prob_path = output_dir / f"{sample_id}_prob.npy"
+                    np.save(prob_path, prob_map_i)
+                    var_path = output_dir / f"{sample_id}_tta_variance.npy"
+                    np.save(var_path, variance_map_i)
+
+                    unc_mean = float(entropy_map.mean())
+                    boundary = boundary_band(pred_mask.astype(bool), args.boundary_radius)
+                    if boundary.any():
+                        boundary_entropy = entropy_map[boundary]
+                        unc_boundary_mean = float(boundary_entropy.mean())
+                        unc_boundary_p95 = float(np.percentile(boundary_entropy, 95))
+                        boundary_variance = variance_map_i[boundary]
+                        variance_boundary_mean = float(boundary_variance.mean())
+                    else:
+                        unc_boundary_mean = unc_mean
+                        unc_boundary_p95 = unc_mean
+                        variance_boundary_mean = float(variance_map_i.mean())
+
+                    record = {
+                        "index": global_index,
+                        "sample_id": sample_id,
+                        "unc_mean": unc_mean,
+                        "unc_boundary_mean": unc_boundary_mean,
+                        "unc_boundary_p95": unc_boundary_p95,
+                        "unc_map": str(entropy_path),
+                        "entropy_map": str(entropy_path),
+                        "variance_map": str(var_path),
+                        "variance_mean": float(variance_map_i.mean()),
+                        "variance_boundary_mean": variance_boundary_mean,
+                        "pred_mask": str(pred_path),
+                        "prob_map": str(prob_path),
+                        "method": method,
+                        "tta_transform_count": len(transforms),
+                    }
+                    record.update(meta)
+                    records.append(record)
+        elif method == "disagreement":
+            for batch_idx, (_, targets) in enumerate(loader):
+                batch_size = targets.size(0)
+                for i in range(batch_size):
+                    global_index = batch_idx * args.batch_size + i
+                    meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
+                    sample_id = meta.get("sample_id", f"sample_{global_index}")
+                    extra_masks = meta.get("multi_mask_paths") or []
+                    target_np = targets[i].cpu().numpy()
+                    height, width = target_np.shape[-2], target_np.shape[-1]
+                    if extra_masks:
+                        mask_arrays = []
+                        for path in extra_masks:
+                            mask_img = (
+                                Image.open(path)
+                                .convert("L")
+                                .resize((width, height), Image.NEAREST)
+                            )
+                            mask_arr = (np.array(mask_img, dtype=np.uint8) > 0).astype(
+                                np.float32
+                            )
+                            mask_arrays.append(mask_arr)
+                        if mask_arrays:
+                            stack = np.stack(mask_arrays, axis=0)
+                            prob_map = stack.mean(axis=0)
+                        else:
+                            prob_map = np.zeros((height, width), dtype=np.float32)
+                    else:
+                        prob_map = np.zeros((height, width), dtype=np.float32)
+                    variance_map = prob_map * (1.0 - prob_map)
+                    pred_mask = (prob_map >= 0.5).astype(np.uint8)
+                    var_path = output_dir / f"{sample_id}_disagreement.npy"
+                    np.save(var_path, variance_map)
+                    pred_path = output_dir / f"{sample_id}_pred.npy"
+                    np.save(pred_path, pred_mask)
+                    prob_path = output_dir / f"{sample_id}_prob.npy"
+                    np.save(prob_path, prob_map)
+                    unc_mean = float(variance_map.mean())
+                    boundary = boundary_band(pred_mask.astype(bool), args.boundary_radius)
+                    if boundary.any():
+                        boundary_values = variance_map[boundary]
+                        unc_boundary_mean = float(boundary_values.mean())
+                        unc_boundary_p95 = float(np.percentile(boundary_values, 95))
+                    else:
+                        unc_boundary_mean = unc_mean
+                        unc_boundary_p95 = unc_mean
+                    record = {
+                        "index": global_index,
+                        "sample_id": sample_id,
+                        "unc_mean": unc_mean,
+                        "unc_boundary_mean": unc_boundary_mean,
+                        "unc_boundary_p95": unc_boundary_p95,
+                        "unc_map": str(var_path),
+                        "pred_mask": str(pred_path),
+                        "prob_map": str(prob_path),
+                        "method": method,
+                        "annotator_count": len(extra_masks),
+                    }
                     record.update(meta)
                     records.append(record)
         else:

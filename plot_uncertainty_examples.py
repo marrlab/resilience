@@ -17,7 +17,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot qualitative uncertainty examples.")
     parser.add_argument("--runs_dir", type=str, default="runs")
     parser.add_argument(
-        "--datasets", type=str, nargs="+", default=["dsb2018", "monuseg", "rus"]
+        "--datasets",
+        type=str,
+        nargs="+",
+        default=["dsb2018", "monuseg", "rus", "nuinsseg", "isic2017"],
     )
     parser.add_argument("--split", type=str, default="test")
     parser.add_argument("--output", type=str, default="runs/uncertainty_plots")
