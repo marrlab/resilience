@@ -231,6 +231,79 @@ def _resolve_isic_root(root: Optional[Path]) -> Path:
     )
 
 
+def _resolve_kvasirseg_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/kvasir-seg/Kvasir-SEG"),
+            Path("datasets/kvasir/Kvasir-SEG"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "splits" / "train" / "images").exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate Kvasir-SEG splits. Run datasets/kvasir-seg/split_polyps.py --dataset kvasir."
+    )
+
+
+def _resolve_clinicdb_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/kvasir-seg/CVC-ClinicDB"),
+            Path("datasets/kvasir/CVC-ClinicDB"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "splits" / "train" / "images").exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate CVC-ClinicDB splits. Run datasets/kvasir-seg/split_polyps.py --dataset clinicdb."
+    )
+
+
+def _resolve_drive_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/DRIVE/DRIVE"),
+            Path("datasets/drive/DRIVE"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if (candidate / "training" / "images").exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate DRIVE dataset root. Expected directories like datasets/DRIVE/DRIVE/training."
+    )
+
+
+def _resolve_promise12_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path("datasets/PROMISE12"),
+            Path("datasets/promise12"),
+        )
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        train_dir = candidate / "trainning"
+        if train_dir.exists():
+            return candidate
+    raise FileNotFoundError(
+        "Unable to locate PROMISE12 dataset root. Expected directories like datasets/PROMISE12/trainning."
+    )
+
+
 def _split_cases(
     items: Sequence[Path], val_ratio: float, test_ratio: float
 ) -> Dict[str, List[Path]]:
@@ -849,6 +922,210 @@ class ISIC2017Dataset(Dataset):
         return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
 
 
+class DriveDataset(Dataset):
+    class_names = ["background", "vessel"]
+    num_classes = 2
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        drive_root = _resolve_drive_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("DRIVE supports 'train', 'val', or 'test' splits.")
+        if split_key == "val":
+            split_dir = drive_root / "training"
+            self.samples = self._build_samples(split_dir, offset=10, limit=10)
+        else:
+            if split_key == "train":
+                split_dir = drive_root / "training"
+                self.samples = self._build_samples(split_dir, offset=0, limit=10)
+            else:
+                split_dir = drive_root / "test"
+                self.samples = self._build_samples(split_dir)
+        self.image_size = image_size
+        self.augment = augment
+
+    def _build_samples(
+        self, split_dir: Path, offset: int = 0, limit: Optional[int] = None
+    ) -> List[Tuple[Path, Path]]:
+        images_dir = split_dir / "images"
+        manual_dir = split_dir / "1st_manual"
+        if not images_dir.exists():
+            images_dir = split_dir / "Images"
+        if not manual_dir.exists():
+            manual_dir = split_dir / "manual"
+        _ensure_exists(images_dir, f"DRIVE images directory at {split_dir}")
+        _ensure_exists(manual_dir, f"DRIVE manual directory at {split_dir}")
+        image_files = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS])
+        if limit is not None:
+            image_files = image_files[offset : offset + limit]
+        samples: List[Tuple[Path, Path]] = []
+        for image_path in image_files:
+            stem = image_path.stem.split("_")[0]
+            mask_path = manual_dir / f"{stem}_manual1.gif"
+            if not mask_path.exists():
+                mask_path = manual_dir / f"{stem}_manual1.png"
+            if not mask_path.exists():
+                continue
+            samples.append((image_path, mask_path))
+        if not samples:
+            raise RuntimeError(f"No DRIVE samples found under {split_dir}")
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
+
+
+class Promise12Dataset(Dataset):
+    class_names = ["background", "prostate"]
+    num_classes = 2
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        try:
+            import SimpleITK as sitk  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("Please install SimpleITK to use the PROMISE12 dataset.") from exc
+        promise_root = _resolve_promise12_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("PROMISE12 supports 'train', 'val', or 'test' splits.")
+        if split_key == "test":
+            case_dir = promise_root / "test"
+            case_paths = self._list_cases(case_dir)
+        else:
+            case_dir = promise_root / "trainning"
+            all_cases = self._list_cases(case_dir)
+            if split_key == "train":
+                case_paths = all_cases[:40]
+            else:
+                case_paths = all_cases[40:]
+        self.slices: List[Tuple[np.ndarray, np.ndarray]] = []
+        for case_path in case_paths:
+            seg_path = case_path.with_name(f"{case_path.stem}_segmentation.mhd")
+            if not seg_path.exists():
+                continue
+            image = sitk.ReadImage(str(case_path))
+            mask = sitk.ReadImage(str(seg_path))
+            img_arr = sitk.GetArrayFromImage(image).astype(np.float32)
+            mask_arr = sitk.GetArrayFromImage(mask).astype(np.uint8)
+            for z in range(img_arr.shape[0]):
+                img_slice = img_arr[z]
+                slice_min = float(img_slice.min())
+                slice_max = float(img_slice.max())
+                if slice_max > slice_min:
+                    norm = (img_slice - slice_min) / (slice_max - slice_min)
+                else:
+                    norm = np.zeros_like(img_slice, dtype=np.float32)
+                img_uint8 = (norm * 255.0).clip(0, 255).astype(np.uint8)
+                mask_slice = (mask_arr[z] > 0).astype(np.uint8)
+                self.slices.append((img_uint8, mask_slice))
+        if not self.slices:
+            raise RuntimeError(f"No PROMISE12 slices were extracted from {case_dir}")
+        self.image_size = image_size
+        self.augment = augment
+
+    def _list_cases(self, directory: Path) -> List[Path]:
+        cases = sorted(directory.glob("Case??.mhd"))
+        if not cases:
+            raise RuntimeError(f"No PROMISE12 cases found in {directory}")
+        return cases
+
+    def __len__(self) -> int:
+        return len(self.slices)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_slice, mask_slice = self.slices[idx]
+        image = Image.fromarray(image_slice, mode="L").convert("RGB")
+        mask = Image.fromarray(mask_slice * 255, mode="L")
+        return _apply_shared_transforms(image, mask, self.image_size, self.augment)
+
+
+class _PolypDataset(Dataset):
+    class_names = ["background", "polyp"]
+    num_classes = 2
+
+    def __init__(self, samples: List[Tuple[Path, Path]], image_size: Optional[Tuple[int, int]], augment: bool):
+        self.samples = samples
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
+
+
+class KvasirSegDataset(_PolypDataset):
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        dataset_root = _resolve_kvasirseg_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("Kvasir-SEG supports 'train', 'val', or 'test' splits.")
+        split_dir = dataset_root / "splits" / split_key
+        images_dir = split_dir / "images"
+        ann_dir = split_dir / "annotations"
+        _ensure_exists(images_dir, f"Kvasir-SEG images for split '{split_key}'")
+        _ensure_exists(ann_dir, f"Kvasir-SEG annotations for split '{split_key}'")
+        samples = _match_image_label_paths(images_dir, ann_dir)
+        if not samples:
+            raise RuntimeError(f"No samples found in {images_dir}")
+        super().__init__(samples, image_size, augment)
+
+
+class ClinicDBDataset(_PolypDataset):
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        dataset_root = _resolve_clinicdb_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("ClinicDB supports 'train', 'val', or 'test' splits.")
+        split_dir = dataset_root / "splits" / split_key
+        images_dir = split_dir / "images"
+        ann_dir = split_dir / "annotations"
+        _ensure_exists(images_dir, f"CVC-ClinicDB images for split '{split_key}'")
+        _ensure_exists(ann_dir, f"CVC-ClinicDB annotations for split '{split_key}'")
+        samples = _match_image_label_paths(images_dir, ann_dir)
+        if not samples:
+            raise RuntimeError(f"No samples found in {images_dir}")
+        super().__init__(samples, image_size, augment)
+
+
 def _maybe_subset(dataset: Dataset, subset_size: Optional[int]) -> Dataset:
     if subset_size is None or subset_size <= 0 or subset_size >= len(dataset):
         return dataset
@@ -926,6 +1203,42 @@ def build_dataset(
         if split not in {"train", "val", "test"}:
             raise ValueError("ISIC2017 supports 'train', 'val', or 'test' splits.")
         dataset = ISIC2017Dataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "kvasirseg":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("Kvasir-SEG supports 'train', 'val', or 'test' splits.")
+        dataset = KvasirSegDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "clinicdb":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("ClinicDB supports 'train', 'val', or 'test' splits.")
+        dataset = ClinicDBDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "drive":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("DRIVE supports 'train', 'val', or 'test' splits.")
+        dataset = DriveDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "promise12":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("PROMISE12 supports 'train', 'val', or 'test' splits.")
+        dataset = Promise12Dataset(
             root=root_path,
             split=split,
             image_size=image_size,

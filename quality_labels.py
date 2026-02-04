@@ -36,8 +36,18 @@ def parse_args() -> argparse.Namespace:
         "--datasets",
         type=str,
         nargs="+",
-        default=["dsb2018", "monuseg", "rus", "nuinsseg", "isic2017"],
-        help="Datasets to evaluate (default: dsb2018 monuseg rus nuinsseg isic2017).",
+        default=[
+            "dsb2018",
+            "monuseg",
+            "rus",
+            "nuinsseg",
+            "isic2017",
+            "kvasirseg",
+            "clinicdb",
+            "drive",
+            "promise12",
+        ],
+        help="Datasets to evaluate (default includes all supported medical sets).",
     )
     parser.add_argument("--split", type=str, default="test", help="Split to evaluate.")
     parser.add_argument(
