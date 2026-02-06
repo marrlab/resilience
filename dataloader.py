@@ -663,7 +663,7 @@ class DSB2018Dataset(Dataset):
         dsb_root = _resolve_dsb_root(root)
         train_root = dsb_root / "stage1_train"
         _ensure_exists(train_root, "DSB2018 stage1_train directory")
-        case_dirs = sorted([p for p in train_root.iterdir() if p.is_dir()])
+        case_dirs = sorted([p for p in train_root.iterdir() if p.is_dir() and p.name != "augmented"])
         if not case_dirs:
             raise RuntimeError(f"No case folders found under {train_root}")
         splits = _split_cases(case_dirs, val_ratio=val_ratio, test_ratio=test_ratio)
@@ -954,11 +954,21 @@ class DriveDataset(Dataset):
         self, split_dir: Path, offset: int = 0, limit: Optional[int] = None
     ) -> List[Tuple[Path, Path]]:
         images_dir = split_dir / "images"
-        manual_dir = split_dir / "1st_manual"
-        if not images_dir.exists():
-            images_dir = split_dir / "Images"
-        if not manual_dir.exists():
-            manual_dir = split_dir / "manual"
+        manual_dir = None
+        mask_style = False
+        if images_dir.exists():
+            manual_dir = split_dir / "1st_manual"
+        else:
+            alt_images = split_dir / "Images"
+            alt_manual = split_dir / "manual"
+            if alt_images.exists():
+                images_dir = alt_images
+                manual_dir = alt_manual
+        if manual_dir is None or not manual_dir.exists():
+            mask_dir = split_dir / "mask"
+            if mask_dir.exists():
+                manual_dir = mask_dir
+                mask_style = True
         _ensure_exists(images_dir, f"DRIVE images directory at {split_dir}")
         _ensure_exists(manual_dir, f"DRIVE manual directory at {split_dir}")
         image_files = sorted([p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS])
@@ -966,10 +976,16 @@ class DriveDataset(Dataset):
             image_files = image_files[offset : offset + limit]
         samples: List[Tuple[Path, Path]] = []
         for image_path in image_files:
-            stem = image_path.stem.split("_")[0]
-            mask_path = manual_dir / f"{stem}_manual1.gif"
-            if not mask_path.exists():
-                mask_path = manual_dir / f"{stem}_manual1.png"
+            if mask_style:
+                mask_path = manual_dir / f"{image_path.stem}_mask.gif"
+                if not mask_path.exists():
+                    mask_path = manual_dir / f"{image_path.stem}_mask.png"
+                stem = image_path.stem
+            else:
+                stem = image_path.stem.split("_")[0]
+                mask_path = manual_dir / f"{stem}_manual1.gif"
+                if not mask_path.exists():
+                    mask_path = manual_dir / f"{stem}_manual1.png"
             if not mask_path.exists():
                 continue
             samples.append((image_path, mask_path))

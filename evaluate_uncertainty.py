@@ -360,6 +360,7 @@ def main() -> None:
         raise FileNotFoundError(f"Runs directory not found: {runs_dir}")
 
     aggregate: Dict[str, Dict[str, float]] = {}
+    any_summary = False
     fusion_pairs: List[Tuple[str, str]] = []
     if args.fusion_pairs:
         for pair_str in args.fusion_pairs:
@@ -439,6 +440,7 @@ def main() -> None:
                 continue
             summary = summarize_dataset(dataset, args.split, records_list)
             aggregate[f"{dataset}:{args.split}:{method}"] = summary
+            any_summary = True
             print(
                 f"{dataset} [{args.split}] {method} aggregate | "
                 f"Dice@80={summary['dice_at_80']:.4f} (tau={summary['tau_80']:.4f}) "
