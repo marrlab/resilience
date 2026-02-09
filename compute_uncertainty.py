@@ -533,8 +533,6 @@ def generate_uncertainty(
                     }
                     record.update(meta)
                     records.append(record)
-                    record.update(meta)
-                    records.append(record)
         elif method == "flicker":
             thresh = args.flicker_threshold
             window = args.flicker_window

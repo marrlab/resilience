@@ -453,11 +453,17 @@ def main() -> None:
             )
 
     if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(aggregate, f, indent=2)
-        print(f"Saved aggregate metrics to {out_path}")
+        if aggregate:
+            out_path = Path(args.output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(aggregate, f, indent=2)
+            print(f"Saved aggregate metrics to {out_path}")
+        else:
+            print(
+                f"No aggregate metrics computed for datasets {args.datasets}; "
+                "skipping output."
+            )
 
 
 if __name__ == "__main__":
