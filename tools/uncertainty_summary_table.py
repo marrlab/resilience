@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 from pathlib import Path
 from statistics import mean, stdev
 from typing import Dict, List
@@ -26,6 +27,13 @@ def parse_args() -> argparse.Namespace:
         default=["dice_at_80", "dice_at_90", "aurc", "auroc", "auprc"],
         help="Metric keys to include in the table.",
     )
+    parser.add_argument(
+        "--exclude",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Datasets to exclude when aggregating (match dataset name in dataset:split:method).",
+    )
     return parser.parse_args()
 
 
@@ -35,15 +43,21 @@ def load_summary(path: Path) -> Dict[str, Dict[str, float]]:
 
 
 def collect_metrics(
-    paths: List[Path], metric_keys: List[str]
+    paths: List[Path], metric_keys: List[str], exclude: List[str]
 ) -> Dict[str, Dict[str, List[float]]]:
+    def normalize(name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", name.lower())
+
+    exclude_set = {normalize(name) for name in exclude}
     bucket: Dict[str, Dict[str, List[float]]] = {}
     for path in paths:
         data = load_summary(path)
         for key, metrics in data.items():
             try:
-                _, _, method = key.split(":")
+                dataset, _, method = key.split(":")
             except ValueError:
+                continue
+            if normalize(dataset) in exclude_set:
                 continue
             method_bucket = bucket.setdefault(method, {k: [] for k in metric_keys})
             for metric in metric_keys:
@@ -68,7 +82,7 @@ def main() -> None:
     if not paths:
         print(f"No summary files matched pattern '{args.pattern}'.")
         return
-    bucket = collect_metrics(paths, args.metrics)
+    bucket = collect_metrics(paths, args.metrics, args.exclude)
     if not bucket:
         print("No metrics found in the provided summary files.")
         return

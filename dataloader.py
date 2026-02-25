@@ -23,33 +23,130 @@ def _apply_image_translation(image: Image.Image, dx: int, dy: int, fill) -> Imag
     return canvas
 
 
-def _augment_image_and_mask(image: Image.Image, mask: Image.Image, rng: random.Random) -> Tuple[Image.Image, Image.Image]:
-    angle = rng.uniform(-12.0, 12.0)
+def _center_resize(
+    image: Image.Image,
+    mask: Image.Image,
+    scale: float,
+    rng: random.Random,
+) -> Tuple[Image.Image, Image.Image]:
+    width, height = image.size
+    new_w = max(1, int(round(width * scale)))
+    new_h = max(1, int(round(height * scale)))
+    resample_img = Image.BILINEAR if scale != 1.0 else Image.NEAREST
+    resample_mask = Image.NEAREST
+    resized_img = image.resize((new_w, new_h), resample=resample_img)
+    resized_mask = mask.resize((new_w, new_h), resample=resample_mask)
+    if new_w <= width and new_h <= height:
+        canvas_img = Image.new("RGB", (width, height), (0, 0, 0))
+        canvas_mask = Image.new("L", (width, height), 0)
+        offset = ((width - new_w) // 2, (height - new_h) // 2)
+        canvas_img.paste(resized_img, offset)
+        canvas_mask.paste(resized_mask, offset)
+        return canvas_img, canvas_mask
+    left = max(0, (new_w - width) // 2)
+    top = max(0, (new_h - height) // 2)
+    crop_box = (left, top, left + width, top + height)
+    return resized_img.crop(crop_box), resized_mask.crop(crop_box)
+
+
+def _apply_random_occlusion(image: Image.Image, rng: random.Random) -> Image.Image:
+    width, height = image.size
+    occ_w = rng.randint(max(4, width // 10), max(8, width // 3))
+    occ_h = rng.randint(max(4, height // 10), max(8, height // 3))
+    x0 = rng.randint(0, max(0, width - occ_w))
+    y0 = rng.randint(0, max(0, height - occ_h))
+    draw = ImageDraw.Draw(image)
+    color = tuple(int(rng.uniform(0, 255)) for _ in range(3))
+    draw.rectangle([x0, y0, x0 + occ_w, y0 + occ_h], fill=color)
+    return image
+
+
+def _augment_image_and_mask(
+    image: Image.Image, mask: Image.Image, rng: random.Random
+) -> Tuple[Image.Image, Image.Image]:
+    angle = rng.uniform(-25.0, 25.0)
     image = image.rotate(angle, resample=Image.BILINEAR)
     mask = mask.rotate(angle, resample=Image.NEAREST)
-    if rng.random() < 0.5:
+
+    scale = rng.uniform(0.75, 1.3)
+    image, mask = _center_resize(image, mask, scale, rng)
+
+    if rng.random() < 0.6:
         image = ImageOps.mirror(image)
         mask = ImageOps.mirror(mask)
-    dx = rng.randint(-16, 16)
-    dy = rng.randint(-16, 16)
+
+    dx = rng.randint(-32, 32)
+    dy = rng.randint(-32, 32)
     image = _apply_image_translation(image, dx, dy, fill=(0, 0, 0))
     mask = _apply_image_translation(mask, dx, dy, fill=0)
 
-    image = ImageEnhance.Brightness(image).enhance(rng.uniform(0.8, 1.2))
-    image = ImageEnhance.Contrast(image).enhance(rng.uniform(0.8, 1.2))
-    image = ImageEnhance.Color(image).enhance(rng.uniform(0.8, 1.2))
+    if rng.random() < 0.5:
+        shear = rng.uniform(-10, 10)
+        image = image.transform(
+            image.size,
+            Image.AFFINE,
+            (1, np.tan(np.radians(shear)), 0, 0, 1, 0),
+            resample=Image.BILINEAR,
+        )
+        mask = mask.transform(
+            mask.size,
+            Image.AFFINE,
+            (1, np.tan(np.radians(shear)), 0, 0, 1, 0),
+            resample=Image.NEAREST,
+        )
 
-    if rng.random() < 0.3:
-        image = image.filter(ImageFilter.GaussianBlur(radius=1.2))
+    image = ImageEnhance.Brightness(image).enhance(rng.uniform(0.6, 1.4))
+    image = ImageEnhance.Contrast(image).enhance(rng.uniform(0.6, 1.4))
+    image = ImageEnhance.Color(image).enhance(rng.uniform(0.5, 1.5))
+
+    if rng.random() < 0.5:
+        image = image.filter(ImageFilter.GaussianBlur(radius=rng.uniform(1.0, 2.5)))
+
+    if rng.random() < 0.4:
+        image = _apply_random_occlusion(image, rng)
 
     arr = np.array(image).astype(np.float32) / 255.0
-    noise = np.random.default_rng(rng.randint(0, 2**32 - 1)).normal(0.0, 0.03, arr.shape)
-    arr = np.clip(arr + noise, 0.0, 1.0)
+    rng_np = np.random.default_rng(rng.randint(0, 2**32 - 1))
+    gaussian = rng_np.normal(0.0, 0.06, arr.shape)
+    speckle = arr * rng_np.normal(0.0, 0.04, arr.shape)
+    arr = np.clip(arr + gaussian + speckle, 0.0, 1.0)
+    if rng.random() < 0.3:
+        cutoff = rng.uniform(0.8, 1.2)
+        arr = np.clip(arr ** cutoff, 0.0, 1.0)
     image = Image.fromarray((arr * 255).astype(np.uint8))
 
     mask = (np.array(mask) > 0).astype(np.uint8)
     mask_img = Image.fromarray(mask * 255, mode="L")
     return image, mask_img
+
+
+def _binary_mask_from_path(mask_path: Path) -> Image.Image:
+    mask = Image.open(mask_path).convert("L")
+    mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+    return Image.fromarray(mask_arr * 255, mode="L")
+
+
+def _ensure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def _save_augmented_pair(
+    image_path: Path,
+    mask_path: Path,
+    dest_img: Path,
+    dest_mask: Path,
+    rng: random.Random,
+) -> None:
+    if dest_img.exists() and dest_mask.exists():
+        return
+    image = Image.open(image_path)
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+    mask_img = _binary_mask_from_path(mask_path)
+    local_rng = random.Random(rng.randint(0, 2**32 - 1))
+    image_aug, mask_aug = _augment_image_and_mask(image, mask_img, local_rng)
+    image_aug.save(dest_img)
+    mask_aug.save(dest_mask)
 
 VOC_CLASS_NAMES = [
     "background",
@@ -450,6 +547,142 @@ def _ensure_nuinsseg_augmented_split(root: Path, split: str) -> Tuple[Path, Path
     return aug_img_dir, aug_ann_dir
 
 
+def _ensure_rus_augmented_split(root: Path, split: str) -> Tuple[Path, Path]:
+    base_images = root / "images" / split
+    base_masks = root / "annotations" / split
+    _ensure_exists(base_images, f"RUS images directory for split '{split}'")
+    _ensure_exists(base_masks, f"RUS annotations directory for split '{split}'")
+    dest_root = root / "augmented" / split
+    dest_images = dest_root / "images"
+    dest_masks = dest_root / "annotations"
+    _ensure_directory(dest_images)
+    _ensure_directory(dest_masks)
+    pairs = _match_image_label_paths(base_images, base_masks)
+    rng = random.Random(_AUGMENT_SEED)
+    for image_path, mask_path in pairs:
+        stem = image_path.stem
+        dest_img = dest_images / f"{stem}.png"
+        dest_mask = dest_masks / f"{stem}.png"
+        _save_augmented_pair(image_path, mask_path, dest_img, dest_mask, rng)
+    return dest_images, dest_masks
+
+
+def _ensure_isic_augmented_split(root: Path, split_key: str, split_name: str) -> Tuple[Path, Path]:
+    images_dir = root / f"ISIC-2017_{split_name}_Data"
+    masks_dir = root / f"ISIC-2017_{split_name}_Part1_GroundTruth"
+    _ensure_exists(images_dir, f"ISIC2017 images directory for {split_name}")
+    _ensure_exists(masks_dir, f"ISIC2017 masks directory for {split_name}")
+    dest_dir = root / f"ISIC-2017_{split_name}_Data_aug"
+    dest_masks = root / f"ISIC-2017_{split_name}_Part1_GroundTruth_aug"
+    _ensure_directory(dest_dir)
+    _ensure_directory(dest_masks)
+    rng = random.Random(_AUGMENT_SEED)
+    for image_path in sorted(images_dir.iterdir()):
+        if image_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+            continue
+        if image_path.stem.endswith("_superpixels"):
+            continue
+        mask_path = masks_dir / f"{image_path.stem}_segmentation.png"
+        if not mask_path.exists():
+            continue
+        dest_img = dest_dir / f"{image_path.stem}.png"
+        dest_mask = dest_masks / f"{image_path.stem}.png"
+        _save_augmented_pair(image_path, mask_path, dest_img, dest_mask, rng)
+    return dest_dir, dest_masks
+
+
+def _ensure_polyp_augmented_split(base_dir: Path, split: str) -> Tuple[Path, Path]:
+    split_dir = base_dir / "splits" / split
+    images_dir = split_dir / "images"
+    ann_dir = split_dir / "annotations"
+    _ensure_exists(images_dir, f"Polyp dataset images for split '{split}'")
+    _ensure_exists(ann_dir, f"Polyp dataset annotations for split '{split}'")
+    dest_root = base_dir / "splits_aug" / split
+    dest_images = dest_root / "images"
+    dest_masks = dest_root / "annotations"
+    _ensure_directory(dest_images)
+    _ensure_directory(dest_masks)
+    pairs = _match_image_label_paths(images_dir, ann_dir)
+    rng = random.Random(_AUGMENT_SEED)
+    for image_path, mask_path in pairs:
+        stem = image_path.stem
+        dest_img = dest_images / f"{stem}.png"
+        dest_mask = dest_masks / f"{stem}.png"
+        _save_augmented_pair(image_path, mask_path, dest_img, dest_mask, rng)
+    return dest_images, dest_masks
+
+
+def _ensure_drive_augmented_split(root: Path, split: str, samples: List[Tuple[Path, Path]]) -> Tuple[Path, Path]:
+    dest_root = root / "augmented" / split
+    dest_images = dest_root / "images"
+    dest_masks = dest_root / "annotations"
+    _ensure_directory(dest_images)
+    _ensure_directory(dest_masks)
+    rng = random.Random(_AUGMENT_SEED)
+    for image_path, mask_path in samples:
+        stem = image_path.stem
+        dest_img = dest_images / f"{stem}.png"
+        dest_mask = dest_masks / f"{stem}.png"
+        _save_augmented_pair(image_path, mask_path, dest_img, dest_mask, rng)
+    return dest_images, dest_masks
+
+
+def _ensure_promise12_augmented_split(root: Path, split: str) -> Tuple[Path, Path]:
+    try:
+        import SimpleITK as sitk  # type: ignore
+    except ImportError as exc:  # pragma: no cover
+        raise ImportError("Please install SimpleITK to use the PROMISE12 dataset.") from exc
+    promise_root = _resolve_promise12_root(root)
+    if split == "test":
+        case_dir = promise_root / "test"
+        case_paths = sorted(case_dir.glob("Case??.mhd"))
+    else:
+        case_dir = promise_root / "trainning"
+        all_cases = sorted(case_dir.glob("Case??.mhd"))
+        if split == "train":
+            case_paths = all_cases[:40]
+        else:
+            case_paths = all_cases[40:]
+    if not case_paths:
+        raise RuntimeError(f"No PROMISE12 cases found for split '{split}'")
+    dest_root = promise_root / "augmented" / split
+    dest_images = dest_root / "images"
+    dest_masks = dest_root / "annotations"
+    _ensure_directory(dest_images)
+    _ensure_directory(dest_masks)
+    rng = random.Random(_AUGMENT_SEED)
+    for case_path in case_paths:
+        seg_path = case_path.with_name(f"{case_path.stem}_segmentation.mhd")
+        if not seg_path.exists():
+            continue
+        image = sitk.ReadImage(str(case_path))
+        mask = sitk.ReadImage(str(seg_path))
+        img_arr = sitk.GetArrayFromImage(image).astype(np.float32)
+        mask_arr = sitk.GetArrayFromImage(mask).astype(np.uint8)
+        for z in range(img_arr.shape[0]):
+            stem = f"{case_path.stem}_z{z:03d}"
+            dest_img = dest_images / f"{stem}.png"
+            dest_mask = dest_masks / f"{stem}.png"
+            if dest_img.exists() and dest_mask.exists():
+                continue
+            slice_arr = img_arr[z]
+            slice_min = float(slice_arr.min())
+            slice_max = float(slice_arr.max())
+            if slice_max > slice_min:
+                norm = (slice_arr - slice_min) / (slice_max - slice_min)
+            else:
+                norm = np.zeros_like(slice_arr, dtype=np.float32)
+            img_uint8 = (norm * 255.0).clip(0, 255).astype(np.uint8)
+            mask_slice = (mask_arr[z] > 0).astype(np.uint8)
+            image_pil = Image.fromarray(img_uint8).convert("RGB")
+            mask_pil = Image.fromarray(mask_slice * 255, mode="L")
+            local_rng = random.Random(rng.randint(0, 2**32 - 1))
+            image_aug, mask_aug = _augment_image_and_mask(image_pil, mask_pil, local_rng)
+            image_aug.save(dest_img)
+            mask_aug.save(dest_mask)
+    return dest_images, dest_masks
+
+
 def _list_image_files(directory: Path) -> Dict[str, Path]:
     files: Dict[str, Path] = {}
     for path in directory.iterdir():
@@ -789,12 +1022,19 @@ class RUSDataset(Dataset):
     ) -> None:
         rus_root = _resolve_rus_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in {"train", "val", "test"}:
             raise ValueError("RUS supports 'train', 'val', or 'test' splits.")
-        images_dir = rus_root / "images" / split_key
-        ann_dir = rus_root / "annotations" / split_key
-        _ensure_exists(images_dir, f"RUS images directory for split '{split_key}'")
-        _ensure_exists(ann_dir, f"RUS annotations directory for split '{split_key}'")
+        if augmented:
+            images_dir, ann_dir = _ensure_rus_augmented_split(rus_root, split_key)
+        else:
+            images_dir = rus_root / "images" / split_key
+            ann_dir = rus_root / "annotations" / split_key
+            _ensure_exists(images_dir, f"RUS images directory for split '{split_key}'")
+            _ensure_exists(ann_dir, f"RUS annotations directory for split '{split_key}'")
         samples = _match_image_label_paths(images_dir, ann_dir)
         if not samples:
             raise RuntimeError(
@@ -874,13 +1114,20 @@ class ISIC2017Dataset(Dataset):
     ) -> None:
         isic_root = _resolve_isic_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in self._SPLIT_MAP:
             raise ValueError("ISIC2017 supports 'train', 'val', or 'test' splits.")
         split_name = self._SPLIT_MAP[split_key]
-        images_dir = isic_root / f"ISIC-2017_{split_name}_Data"
-        masks_dir = isic_root / f"ISIC-2017_{split_name}_Part1_GroundTruth"
-        _ensure_exists(images_dir, f"ISIC2017 images directory for {split_name}")
-        _ensure_exists(masks_dir, f"ISIC2017 masks directory for {split_name}")
+        if augmented:
+            images_dir, masks_dir = _ensure_isic_augmented_split(isic_root, split_key, split_name)
+        else:
+            images_dir = isic_root / f"ISIC-2017_{split_name}_Data"
+            masks_dir = isic_root / f"ISIC-2017_{split_name}_Part1_GroundTruth"
+            _ensure_exists(images_dir, f"ISIC2017 images directory for {split_name}")
+            _ensure_exists(masks_dir, f"ISIC2017 masks directory for {split_name}")
         multi_dirs = [
             d
             for d in sorted(isic_root.glob(f"ISIC-2017_{split_name}_Part1_GroundTruth*"))
@@ -935,18 +1182,26 @@ class DriveDataset(Dataset):
     ) -> None:
         drive_root = _resolve_drive_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in {"train", "val", "test"}:
             raise ValueError("DRIVE supports 'train', 'val', or 'test' splits.")
         if split_key == "val":
             split_dir = drive_root / "training"
-            self.samples = self._build_samples(split_dir, offset=10, limit=10)
+            base_samples = self._build_samples(split_dir, offset=10, limit=10)
+        elif split_key == "train":
+            split_dir = drive_root / "training"
+            base_samples = self._build_samples(split_dir, offset=0, limit=10)
         else:
-            if split_key == "train":
-                split_dir = drive_root / "training"
-                self.samples = self._build_samples(split_dir, offset=0, limit=10)
-            else:
-                split_dir = drive_root / "test"
-                self.samples = self._build_samples(split_dir)
+            split_dir = drive_root / "test"
+            base_samples = self._build_samples(split_dir)
+        if augmented:
+            images_dir, ann_dir = _ensure_drive_augmented_split(drive_root, split_key, base_samples)
+            self.samples = _match_image_label_paths(images_dir, ann_dir)
+        else:
+            self.samples = base_samples
         self.image_size = image_size
         self.augment = augment
 
@@ -1022,8 +1277,21 @@ class Promise12Dataset(Dataset):
             raise ImportError("Please install SimpleITK to use the PROMISE12 dataset.") from exc
         promise_root = _resolve_promise12_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in {"train", "val", "test"}:
             raise ValueError("PROMISE12 supports 'train', 'val', or 'test' splits.")
+        self.is_augmented = augmented
+        self.image_size = image_size
+        self.augment = augment
+        self.samples: List[Tuple[Path, Path]] = []
+        if augmented:
+            images_dir, ann_dir = _ensure_promise12_augmented_split(promise_root, split_key)
+            self.samples = _match_image_label_paths(images_dir, ann_dir)
+            self.slices = []
+            return
         if split_key == "test":
             case_dir = promise_root / "test"
             case_paths = self._list_cases(case_dir)
@@ -1034,7 +1302,7 @@ class Promise12Dataset(Dataset):
                 case_paths = all_cases[:40]
             else:
                 case_paths = all_cases[40:]
-        self.slices: List[Tuple[np.ndarray, np.ndarray]] = []
+        self.slices = []
         for case_path in case_paths:
             seg_path = case_path.with_name(f"{case_path.stem}_segmentation.mhd")
             if not seg_path.exists():
@@ -1056,8 +1324,6 @@ class Promise12Dataset(Dataset):
                 self.slices.append((img_uint8, mask_slice))
         if not self.slices:
             raise RuntimeError(f"No PROMISE12 slices were extracted from {case_dir}")
-        self.image_size = image_size
-        self.augment = augment
 
     def _list_cases(self, directory: Path) -> List[Path]:
         cases = sorted(directory.glob("Case??.mhd"))
@@ -1066,9 +1332,18 @@ class Promise12Dataset(Dataset):
         return cases
 
     def __len__(self) -> int:
+        if getattr(self, "is_augmented", False):
+            return len(self.samples)
         return len(self.slices)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        if getattr(self, "is_augmented", False):
+            image_path, mask_path = self.samples[idx]
+            image = Image.open(image_path).convert("RGB")
+            mask = Image.open(mask_path).convert("L")
+            mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+            mask_img = Image.fromarray(mask_arr * 255, mode="L")
+            return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
         image_slice, mask_slice = self.slices[idx]
         image = Image.fromarray(image_slice, mode="L").convert("RGB")
         mask = Image.fromarray(mask_slice * 255, mode="L")
@@ -1106,13 +1381,20 @@ class KvasirSegDataset(_PolypDataset):
     ) -> None:
         dataset_root = _resolve_kvasirseg_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in {"train", "val", "test"}:
             raise ValueError("Kvasir-SEG supports 'train', 'val', or 'test' splits.")
-        split_dir = dataset_root / "splits" / split_key
-        images_dir = split_dir / "images"
-        ann_dir = split_dir / "annotations"
-        _ensure_exists(images_dir, f"Kvasir-SEG images for split '{split_key}'")
-        _ensure_exists(ann_dir, f"Kvasir-SEG annotations for split '{split_key}'")
+        if augmented:
+            images_dir, ann_dir = _ensure_polyp_augmented_split(dataset_root, split_key)
+        else:
+            split_dir = dataset_root / "splits" / split_key
+            images_dir = split_dir / "images"
+            ann_dir = split_dir / "annotations"
+            _ensure_exists(images_dir, f"Kvasir-SEG images for split '{split_key}'")
+            _ensure_exists(ann_dir, f"Kvasir-SEG annotations for split '{split_key}'")
         samples = _match_image_label_paths(images_dir, ann_dir)
         if not samples:
             raise RuntimeError(f"No samples found in {images_dir}")
@@ -1129,13 +1411,20 @@ class ClinicDBDataset(_PolypDataset):
     ) -> None:
         dataset_root = _resolve_clinicdb_root(root)
         split_key = split.lower()
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
         if split_key not in {"train", "val", "test"}:
             raise ValueError("ClinicDB supports 'train', 'val', or 'test' splits.")
-        split_dir = dataset_root / "splits" / split_key
-        images_dir = split_dir / "images"
-        ann_dir = split_dir / "annotations"
-        _ensure_exists(images_dir, f"CVC-ClinicDB images for split '{split_key}'")
-        _ensure_exists(ann_dir, f"CVC-ClinicDB annotations for split '{split_key}'")
+        if augmented:
+            images_dir, ann_dir = _ensure_polyp_augmented_split(dataset_root, split_key)
+        else:
+            split_dir = dataset_root / "splits" / split_key
+            images_dir = split_dir / "images"
+            ann_dir = split_dir / "annotations"
+            _ensure_exists(images_dir, f"CVC-ClinicDB images for split '{split_key}'")
+            _ensure_exists(ann_dir, f"CVC-ClinicDB annotations for split '{split_key}'")
         samples = _match_image_label_paths(images_dir, ann_dir)
         if not samples:
             raise RuntimeError(f"No samples found in {images_dir}")
@@ -1197,8 +1486,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "rus":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("RUS supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("RUS supports 'train', 'val', 'test', or *_aug splits.")
         dataset = RUSDataset(
             root=root_path,
             split=split,
@@ -1216,8 +1506,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "isic2017":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("ISIC2017 supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("ISIC2017 supports 'train', 'val', 'test', or *_aug splits.")
         dataset = ISIC2017Dataset(
             root=root_path,
             split=split,
@@ -1225,8 +1516,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "kvasirseg":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("Kvasir-SEG supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("Kvasir-SEG supports 'train', 'val', 'test', or *_aug splits.")
         dataset = KvasirSegDataset(
             root=root_path,
             split=split,
@@ -1234,8 +1526,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "clinicdb":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("ClinicDB supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("ClinicDB supports 'train', 'val', 'test', or *_aug splits.")
         dataset = ClinicDBDataset(
             root=root_path,
             split=split,
@@ -1243,8 +1536,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "drive":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("DRIVE supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("DRIVE supports 'train', 'val', 'test', or *_aug splits.")
         dataset = DriveDataset(
             root=root_path,
             split=split,
@@ -1252,8 +1546,9 @@ def build_dataset(
             augment=augment,
         )
     elif dataset_name == "promise12":
-        if split not in {"train", "val", "test"}:
-            raise ValueError("PROMISE12 supports 'train', 'val', or 'test' splits.")
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("PROMISE12 supports 'train', 'val', 'test', or *_aug splits.")
         dataset = Promise12Dataset(
             root=root_path,
             split=split,

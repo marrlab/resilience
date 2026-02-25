@@ -186,6 +186,21 @@ def summarize_dataset(dataset: str, split: str, records: List[List[Dict]]) -> Di
     return summary
 
 
+def summarize_run_stats(run_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    if not run_metrics:
+        return {}
+    keys = run_metrics[0].keys()
+    stats: Dict[str, float] = {"run_count": len(run_metrics)}
+    for key in keys:
+        values = [metrics.get(key) for metrics in run_metrics if key in metrics]
+        values = [float(v) for v in values if v is not None and not np.isnan(v)]
+        if not values:
+            continue
+        stats[f"{key}_mean"] = float(np.mean(values))
+        stats[f"{key}_std"] = float(np.std(values))
+    return stats
+
+
 def _record_key(rec: Dict) -> Optional[str]:
     return rec.get("sample_key") or rec.get("sample_id") or rec.get("index")
 
@@ -438,7 +453,15 @@ def main() -> None:
         for method, records_list in dataset_records.items():
             if not records_list:
                 continue
+            run_metrics: List[Dict[str, float]] = []
+            for run_records in records_list:
+                rc = risk_coverage_metrics(run_records)
+                if not rc:
+                    continue
+                ed = error_detection_metrics(run_records)
+                run_metrics.append({**rc, **ed})
             summary = summarize_dataset(dataset, args.split, records_list)
+            summary.update(summarize_run_stats(run_metrics))
             aggregate[f"{dataset}:{args.split}:{method}"] = summary
             any_summary = True
             print(

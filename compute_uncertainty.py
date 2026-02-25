@@ -622,22 +622,37 @@ def generate_uncertainty(
                     prob_map = probs.max(axis=1)
                     pred_mask = probs.argmax(axis=1)
 
+                frame_buffers: List[List[np.ndarray]] = [
+                    [pred_mask[i].astype(np.uint8)] for i in range(pred_mask.shape[0])
+                ]
+
                 perturbed_state = state.clone()
                 noise = torch.randn_like(perturbed_state) * noise_std
                 perturbed_state = perturbed_state + noise
-                for _ in range(relax_steps):
-                    perturbed_state = model.update(perturbed_state, fire_rate=None)
-                logits_relaxed = select_logits(perturbed_state, num_classes)
-                probs_relaxed = torch.softmax(logits_relaxed, dim=1).cpu().numpy()
+
+                probs_relaxed: np.ndarray = prob_map
+                pred_relaxed: np.ndarray = pred_mask
+
+                for relax_idx in range(relax_steps + 1):
+                    logits_relaxed = select_logits(perturbed_state, num_classes)
+                    probs_relaxed = torch.softmax(logits_relaxed, dim=1).cpu().numpy()
+                    if num_classes <= 1:
+                        pred_relaxed = probs_relaxed[:, 0] >= 0.5
+                    elif num_classes == 2:
+                        pred_relaxed = probs_relaxed[:, 1] >= 0.5
+                    else:
+                        pred_relaxed = probs_relaxed.argmax(axis=1)
+                    for buffer, mask_frame in zip(frame_buffers, pred_relaxed):
+                        buffer.append(mask_frame.astype(np.uint8))
+                    if relax_idx < relax_steps:
+                        perturbed_state = model.update(perturbed_state, fire_rate=None)
+
                 if num_classes <= 1:
-                    prob_relaxed = probs_relaxed[:, 0]
-                    pred_relaxed = prob_relaxed >= 0.5
+                    prob_relaxed_final = probs_relaxed[:, 0]
                 elif num_classes == 2:
-                    prob_relaxed = probs_relaxed[:, 1]
-                    pred_relaxed = prob_relaxed >= 0.5
+                    prob_relaxed_final = probs_relaxed[:, 1]
                 else:
-                    prob_relaxed = probs_relaxed.max(axis=1)
-                    pred_relaxed = probs_relaxed.argmax(axis=1)
+                    prob_relaxed_final = probs_relaxed.max(axis=1)
 
                 for i in range(prob_map.shape[0]):
                     global_index = batch_idx * args.batch_size + i
@@ -649,6 +664,8 @@ def generate_uncertainty(
                     union = np.logical_or(mask_a, mask_b).sum()
                     iou = intersection / union if union > 0 else 1.0
                     unc_resilience = 1.0 - iou
+                    frames_path = output_dir / f"{sample_id}_resilience_frames.npy"
+                    np.save(frames_path, np.stack(frame_buffers[i], axis=0))
                     record = {
                         "index": global_index,
                         "sample_id": sample_id,
@@ -658,11 +675,12 @@ def generate_uncertainty(
                         "unc_map": str(output_dir / f"{sample_id}_resilience.npy"),
                         "pred_mask": str(output_dir / f"{sample_id}_pred.npy"),
                         "prob_map": str(output_dir / f"{sample_id}_prob.npy"),
+                        "resilience_frames": str(frames_path),
                         "method": method,
                     }
                     np.save(output_dir / f"{sample_id}_resilience.npy", mask_a.astype(np.uint8))
                     np.save(output_dir / f"{sample_id}_pred.npy", mask_b)
-                    np.save(output_dir / f"{sample_id}_prob.npy", prob_relaxed[i])
+                    np.save(output_dir / f"{sample_id}_prob.npy", prob_relaxed_final[i])
                     record.update(meta)
                     records.append(record)
         elif method == "tta":
