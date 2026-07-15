@@ -44,10 +44,14 @@ DATASET_DEFAULT_ROOTS = {
         "datasets/kvasir-seg/CVC-ClinicDB",
     ],
     "drive": [
-        "datasets/DRIVE/DRIVE",
+        "Datasets/DRIVE",
     ],
     "promise12": [
         "datasets/PROMISE12",
+    ],
+    "raabin": [
+        "datasets/raabin-wbc",
+        "datasets/raabin",
     ],
 }
 
@@ -68,6 +72,7 @@ def parse_args() -> argparse.Namespace:
             "clinicdb",
             "drive",
             "promise12",
+            "raabin",
         ],
         required=True,
         help="Dataset to use.",

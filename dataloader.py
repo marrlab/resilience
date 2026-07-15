@@ -1429,6 +1429,55 @@ class ClinicDBDataset(_PolypDataset):
         if not samples:
             raise RuntimeError(f"No samples found in {images_dir}")
         super().__init__(samples, image_size, augment)
+        
+
+class RaabinWBCDataset(Dataset):
+    class_names = ["background", "wbc"]
+    num_classes = 2
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+    ) -> None:
+        raabin_root = Path(root) if root else Path("datasets/raabin-wbc")
+        split_key = split.lower()
+        
+        augmented = False
+        if split_key.endswith("_aug"):
+            augmented = True
+            split_key = split_key[:-4]
+            
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("Raabin-WBC supports 'train', 'val', or 'test' splits.")
+            
+        images_dir = raabin_root / "splits" / split_key / "images"
+        ann_dir = raabin_root / "splits" / split_key / "annotations"
+        
+        if not images_dir.exists():
+            images_dir = raabin_root / split_key / "images"
+            ann_dir = raabin_root / split_key / "annotations"
+
+        _ensure_exists(images_dir, f"Raabin-WBC images directory for split '{split_key}'")
+        _ensure_exists(ann_dir, f"Raabin-WBC annotations directory for split '{split_key}'")
+        
+        self.samples = _match_image_label_paths(images_dir, ann_dir)
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
+        
+        mask_arr = (np.array(mask, dtype=np.uint8) > 0).astype(np.uint8)
+        mask_img = Image.fromarray(mask_arr, mode="L")
+        return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
 
 
 def _maybe_subset(dataset: Dataset, subset_size: Optional[int]) -> Dataset:
@@ -1550,6 +1599,17 @@ def build_dataset(
         if base_split not in {"train", "val", "test"}:
             raise ValueError("PROMISE12 supports 'train', 'val', 'test', or *_aug splits.")
         dataset = Promise12Dataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+        
+    elif dataset_name == "raabin":
+        base_split = split[:-4] if split.endswith("_aug") else split
+        if base_split not in {"train", "val", "test"}:
+            raise ValueError("Raabin-WBC supports 'train', 'val', 'test', or *_aug splits.")
+        dataset = RaabinWBCDataset(
             root=root_path,
             split=split,
             image_size=image_size,

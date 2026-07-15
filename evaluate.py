@@ -51,6 +51,10 @@ DATASET_DEFAULT_ROOTS = {
     "promise12": [
         "datasets/PROMISE12",
     ],
+    "raabin": [
+        "datasets/raabin-wbc",
+        "datasets/raabin",
+    ],
 }
 
 
@@ -71,6 +75,7 @@ def parse_args() -> argparse.Namespace:
             "clinicdb",
             "drive",
             "promise12",
+            "raabin",
         ],
         required=True,
         help="Dataset name.",

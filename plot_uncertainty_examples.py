@@ -30,6 +30,7 @@ def parse_args() -> argparse.Namespace:
             "clinicdb",
             "drive",
             "promise12",
+            "raabin",
         ],
     )
     parser.add_argument("--split", type=str, default="test")
