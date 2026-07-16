@@ -21,8 +21,16 @@ def parse_args() -> argparse.Namespace:
         "--metrics",
         type=str,
         nargs="+",
-        default=["dice_at_80", "dice_at_90", "aurc", "auroc", "auprc"],
-        help="Metric keys to display.",
+        default=[
+            "dice_at_80",
+            "dice_at_90",
+            "delta_dice_90",
+            "delta_dice_90_pct",
+            "aurc",
+            "auroc",
+            "auprc",
+        ],
+        help="Metric keys to display (use delta_dice_90_pct for percentage).",
     )
     return parser.parse_args()
 
@@ -33,6 +41,8 @@ def load_summary(path: Path) -> Dict[str, Dict[str, float]]:
 
 
 def format_metric(metric_name: str, entry: Dict[str, float]) -> str:
+    if metric_name == "delta_dice_90_pct":
+        return format_delta_percent(entry)
     mean_key = f"{metric_name}_mean"
     std_key = f"{metric_name}_std"
     if mean_key in entry and std_key in entry:
@@ -44,6 +54,19 @@ def format_metric(metric_name: str, entry: Dict[str, float]) -> str:
         return f"{float(value):.4f}"
     except (TypeError, ValueError):
         return str(value)
+
+
+def format_delta_percent(entry: Dict[str, float]) -> str:
+    delta_mean = entry.get("delta_dice_90_mean", entry.get("delta_dice_90"))
+    delta_std = entry.get("delta_dice_90_std")
+    mean_all = entry.get("dice_mean_all")
+    if delta_mean is None or mean_all in (None, 0):
+        return "N/A"
+    pct_mean = 100.0 * float(delta_mean) / float(mean_all)
+    if delta_std is not None:
+        pct_std = 100.0 * float(delta_std) / float(mean_all)
+        return f"{pct_mean:.2f}%±{pct_std:.2f}%"
+    return f"{pct_mean:.2f}%"
 
 
 def main() -> None:

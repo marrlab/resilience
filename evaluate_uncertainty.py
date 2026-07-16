@@ -75,6 +75,17 @@ def parse_args() -> argparse.Namespace:
         help="Uncertainty estimation methods to evaluate.",
     )
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument(
+        "--skip_empty_predictions",
+        action="store_true",
+        help="Ignore samples whose predicted mask is entirely empty.",
+    )
+    parser.add_argument(
+        "--min_pred_fraction",
+        type=float,
+        default=0.0,
+        help="Minimum fraction of pixels that must be predicted foreground; lower counts are treated as empty.",
+    )
     return parser.parse_args()
 
 
@@ -183,7 +194,11 @@ def summarize_dataset(dataset: str, split: str, records: List[List[Dict]]) -> Di
         combined.extend(run_records)
     rc = risk_coverage_metrics(combined)
     ed = error_detection_metrics(combined)
+    mean_dice = float(np.mean([rec.get("dice", 0.0) for rec in combined])) if combined else 0.0
+    if "dice_at_90" in rc:
+        rc["delta_dice_90"] = rc["dice_at_90"] - mean_dice
     summary = {**rc, **ed, "num_samples": len(combined)}
+    summary["dice_mean_all"] = mean_dice
     return summary
 
 
@@ -192,13 +207,28 @@ def summarize_run_stats(run_metrics: List[Dict[str, float]]) -> Dict[str, float]
         return {}
     keys = run_metrics[0].keys()
     stats: Dict[str, float] = {"run_count": len(run_metrics)}
+    dice_all_values = [
+        metrics.get("dice_mean_all")
+        for metrics in run_metrics
+        if isinstance(metrics.get("dice_mean_all"), (int, float))
+    ]
     for key in keys:
         values = [metrics.get(key) for metrics in run_metrics if key in metrics]
         values = [float(v) for v in values if v is not None and not np.isnan(v)]
         if not values:
             continue
         stats[f"{key}_mean"] = float(np.mean(values))
-        stats[f"{key}_std"] = float(np.std(values))
+        stats[f"{key}_std"] = float(np.std(values) if len(values) > 1 else 0.0)
+        if key == "delta_dice_90" and dice_all_values:
+            mean_all = float(np.mean(dice_all_values))
+            if mean_all != 0:
+                stats["delta_dice_90_pct_mean"] = stats[f"{key}_mean"] * 100.0 / mean_all
+                stats["delta_dice_90_pct_std"] = stats[f"{key}_std"] * 100.0 / mean_all
+    if dice_all_values:
+        stats["dice_mean_all_mean"] = float(np.mean(dice_all_values))
+        stats["dice_mean_all_std"] = float(
+            np.std(dice_all_values) if len(dice_all_values) > 1 else 0.0
+        )
     return stats
 
 
@@ -339,6 +369,8 @@ def load_and_prepare_records(
     split: str,
     method: str,
     bad_quantile: float,
+    skip_empty: bool,
+    min_pred_fraction: float,
 ) -> Optional[List[Dict]]:
     quality_path = exp_dir / f"quality_{dataset}_{split}.json"
     if not quality_path.exists():
@@ -350,6 +382,26 @@ def load_and_prepare_records(
     joined = join_quality_uncertainty(quality, uncertainty)
     if not joined:
         return None
+    if skip_empty:
+        filtered: List[Dict] = []
+        for rec in joined:
+            pred_path = rec.get("pred_mask")
+            if not pred_path:
+                filtered.append(rec)
+                continue
+            path = Path(pred_path)
+            if not path.exists():
+                filtered.append(rec)
+                continue
+            arr = np.load(path)
+            total_pixels = arr.size
+            foreground = int(np.count_nonzero(arr))
+            fraction = foreground / total_pixels if total_pixels > 0 else 0.0
+            if foreground > 0 and fraction >= min_pred_fraction:
+                filtered.append(rec)
+        joined = filtered
+        if not joined:
+            return None
     mark_bad_samples(joined, bad_quantile)
     return joined
 
@@ -391,7 +443,15 @@ def main() -> None:
         for exp_dir in sorted(runs_dir.glob(f"{dataset}_*")):
             per_method_records: Dict[str, List[Dict]] = {}
             for method in args.methods:
-                joined = load_and_prepare_records(exp_dir, dataset, args.split, method, bad_q)
+                joined = load_and_prepare_records(
+                    exp_dir,
+                    dataset,
+                    args.split,
+                    method,
+                    bad_q,
+                    args.skip_empty_predictions,
+                    args.min_pred_fraction,
+                )
                 if not joined:
                     continue
                 per_method_records[method] = joined
@@ -413,10 +473,22 @@ def main() -> None:
                     log_run_metrics(dataset, rank_name, exp_dir.name, fused_rank)
 
                 val_a = load_and_prepare_records(
-                    exp_dir, dataset, args.fusion_val_split, method_a, bad_q
+                    exp_dir,
+                    dataset,
+                    args.fusion_val_split,
+                    method_a,
+                    bad_q,
+                    args.skip_empty_predictions,
+                    args.min_pred_fraction,
                 )
                 val_b = load_and_prepare_records(
-                    exp_dir, dataset, args.fusion_val_split, method_b, bad_q
+                    exp_dir,
+                    dataset,
+                    args.fusion_val_split,
+                    method_b,
+                    bad_q,
+                    args.skip_empty_predictions,
+                    args.min_pred_fraction,
                 )
                 if not val_a or not val_b:
                     continue
@@ -460,7 +532,10 @@ def main() -> None:
                 if not rc:
                     continue
                 ed = error_detection_metrics(run_records)
-                run_metrics.append({**rc, **ed})
+                dice_mean_all_run = float(
+                    np.mean([rec.get("dice", 0.0) for rec in run_records])
+                ) if run_records else 0.0
+                run_metrics.append({**rc, **ed, "dice_mean_all": dice_mean_all_run})
             summary = summarize_dataset(dataset, args.split, records_list)
             summary.update(summarize_run_stats(run_metrics))
             aggregate[f"{dataset}:{args.split}:{method}"] = summary

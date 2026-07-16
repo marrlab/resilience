@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from statistics import mean, stdev
 
-METRIC_KEYS = ["pixel_accuracy", "mean_iou", "boundary_f1"]
+METRIC_KEYS = ["pixel_accuracy", "mean_iou", "dice", "boundary_f1"]
 
 def collect_metrics(runs_root: Path) -> dict[str, dict[str, list[float]]]:
     datasets: dict[str, dict[str, list[float]]] = {}
@@ -24,6 +24,11 @@ def collect_metrics(runs_root: Path) -> dict[str, dict[str, list[float]]]:
                 value = metrics.get(key)
                 if isinstance(value, (int, float)):
                     bucket[key].append(float(value))
+            if "dice" not in metrics:
+                miou = metrics.get("mean_iou")
+                if isinstance(miou, (int, float)):
+                    dice = (2 * miou) / (1 + miou) if (1 + miou) != 0 else 0.0
+                    bucket.setdefault("dice", []).append(float(dice))
     return datasets
 
 
