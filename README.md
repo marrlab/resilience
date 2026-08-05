@@ -5,10 +5,11 @@ This repository contains the training, evaluation, and uncertainty estimation st
 ## Key Capabilities
 
 - **End-to-end NCA training / evaluation** via `train.py` and `evaluate.py` with configurable steps, channel budgets, image sizes, and datasets.
+- **Optional dropout and MC-dropout baseline** in the shared NCA update network. Dropout is disabled by default, enabled at training time with `--dropout_rate`, and sampled at test time with the `mc_dropout` uncertainty method.
 - **Unified dataloader** (`dataloader.py`) for VOC, CamVid, DSB2018, MoNuSeg (with automatic XML rasterization + augmentation), NuInsSeg (with automatic split generation + augmentation), RUS ultrasound, and ISIC 2017 Task 1 (binary lesions with multi-annotator metadata).
 - **Uncertainty tooling**:
   - `quality_labels.py` computes Dice / boundary scores per sample and records annotator disagreement if available.
-  - `compute_uncertainty.py` implements single forward entropy, stop-time, stability, flicker, resilience, test-time augmentation (TTA), and the ISIC-specific *disagreement* baseline derived from annotator variance.
+  - `compute_uncertainty.py` implements single forward entropy, MC dropout, stop-time, stability, flicker, resilience, test-time augmentation (TTA), and the ISIC-specific *disagreement* baseline derived from annotator variance.
   - `evaluate_uncertainty.py` reports Dice@80/90, AURC, AUROC, AUPRC, and adds two fusion baselines (rank-average and validation-tuned weighted fusion) to combine the best signals.
   - `plot_uncertainty_examples.py` creates qualitative panels.
 - **Augmented “hard” splits** for DSB2018 (photometric + geometric noise), MoNuSeg, and NuInsSeg (`*_aug` splits are generated on-the-fly if missing).
@@ -56,6 +57,20 @@ python train.py \
   --exp_name nuinsseg_baseline
 ```
 
+Train the otherwise identical dropout baseline by passing a non-zero probability:
+
+```bash
+python train.py \
+  --dataset nuinsseg \
+  --data_root datasets/NuInsSeg \
+  --dropout_rate 0.1 \
+  --exp_name nuinsseg_mc_dropout
+```
+
+`--dropout_rate` (also available as `--dropout`) defaults to `0.0`. The value is
+saved in the checkpoint and is restored automatically by evaluation and uncertainty
+scripts. Ordinary validation/evaluation disables dropout, as expected.
+
 Evaluate a checkpoint on a target split:
 
 ```bash
@@ -87,7 +102,7 @@ python evaluate.py \
      --device cuda
    ```
 
-2. **Uncertainty computation** (per-method maps + scalars). Available methods: `single`, `stoptime`, `stability`, `flicker`, `resilience`, `tta`, `disagreement`.
+2. **Uncertainty computation** (per-method maps + scalars). Available methods: `single`, `mc_dropout`, `stoptime`, `stability`, `flicker`, `resilience`, `tta`, `disagreement`.
 
    ```bash
    python compute_uncertainty.py \
@@ -100,6 +115,23 @@ python evaluate.py \
      --device cuda \
      --save_png
    ```
+
+   For a checkpoint trained with non-zero `--dropout_rate`, run the MC-dropout baseline with:
+
+   ```bash
+   python compute_uncertainty.py \
+     --datasets nuinsseg \
+     --split test \
+     --methods mc_dropout \
+     --mc_dropout_samples 20 \
+     --runs_dir runs \
+     --device cuda
+   ```
+
+   MC dropout keeps the rest of the model in evaluation mode, activates only the
+   update-network dropout layer, and uses predictive mutual information as its primary
+   uncertainty map/score. Predictive entropy and variance maps are saved as well.
+   Checkpoints trained with the default `--dropout_rate 0` are skipped for this method.
 
    - `--tta_max_transforms` controls how many geometric transforms are used.
    - `disagreement` requires multi-annotator metadata (ISIC 2017); it falls back to zeros otherwise.

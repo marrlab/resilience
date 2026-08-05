@@ -85,6 +85,7 @@ if __name__ == '__main__':
     fire_rate = float(args.get("fire_rate", 0.5))
     hidden_size = int(args.get("hidden_size", 128))
     input_channels = int(args.get("input_channels", 3))
+    dropout_rate = float(args.get("dropout_rate", 0.0))
     steps = int(args.get("steps_max", 64))
 
     model = BackboneNCA(
@@ -93,7 +94,8 @@ if __name__ == '__main__':
         device=device,
         hidden_size=hidden_size,
         input_channels=input_channels,
-        steps_default=steps
+        steps_default=steps,
+        dropout_rate=dropout_rate,
     ).to(device)
 
     model.load_state_dict(checkpoint["model_state"])

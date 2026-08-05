@@ -19,15 +19,19 @@ class BackboneNCA(nn.Module):
         input_channels: int = 3,
         steps_default: int = 32,
         init_method: str = "standard",
+        dropout_rate: float = 0.0,
     ) -> None:
         super().__init__()
         if channel_n <= 0:
             raise ValueError("channel_n must be positive.")
+        if not 0.0 <= dropout_rate < 1.0:
+            raise ValueError("dropout_rate must be in the range [0, 1).")
         self.channel_n = channel_n
         self.fire_rate = fire_rate
         self.hidden_size = hidden_size
         self.input_channels = max(0, input_channels)
         self.steps_default = max(1, steps_default)
+        self.dropout_rate = dropout_rate
         self.device = device
 
         self.p0 = nn.Conv2d(
@@ -49,6 +53,7 @@ class BackboneNCA(nn.Module):
             padding_mode="reflect",
         )
         self.fc0 = nn.Linear(channel_n * 3, hidden_size)
+        self.dropout = nn.Dropout(p=dropout_rate)
         self.fc1 = nn.Linear(hidden_size, channel_n, bias=False)
         with torch.no_grad():
             self.fc1.weight.zero_()
@@ -68,7 +73,7 @@ class BackboneNCA(nn.Module):
         """Apply one stochastic NCA step (state is BHWC)."""
         inputs = state.permute(0, 3, 1, 2).contiguous()
         dx = self.perceive(inputs).permute(0, 2, 3, 1)
-        dx = self.fc1(F.relu(self.fc0(dx)))
+        dx = self.fc1(self.dropout(F.relu(self.fc0(dx))))
         rate = self.fire_rate if fire_rate is None else fire_rate
         if rate < 1.0:
             mask = (torch.rand_like(dx[..., :1]) <= rate).float()

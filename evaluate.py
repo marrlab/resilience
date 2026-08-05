@@ -106,6 +106,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fire_rate", type=float, default=None)
     parser.add_argument("--hidden_size", type=int, default=None)
     parser.add_argument("--input_channels", type=int, default=None)
+    parser.add_argument(
+        "--dropout_rate",
+        "--dropout",
+        dest="dropout_rate",
+        type=float,
+        default=None,
+        help="Override the checkpoint dropout rate (normally read from the checkpoint).",
+    )
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
@@ -272,6 +280,9 @@ def main() -> None:
     fire_rate = float(extract_param("fire_rate", args.fire_rate, ckpt_args, 0.5))
     hidden_size = int(extract_param("hidden_size", args.hidden_size, ckpt_args, 128))
     input_channels = int(extract_param("input_channels", args.input_channels, ckpt_args, 3))
+    dropout_rate = float(
+        extract_param("dropout_rate", args.dropout_rate, ckpt_args, 0.0)
+    )
     eval_steps = int(
         extract_param("steps_max", args.steps, ckpt_args, ckpt_args.get("steps_max", 64))
     )
@@ -300,6 +311,7 @@ def main() -> None:
         hidden_size=hidden_size,
         input_channels=input_channels,
         steps_default=eval_steps,
+        dropout_rate=dropout_rate,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
@@ -360,6 +372,7 @@ def main() -> None:
             "fire_rate": fire_rate,
             "hidden_size": hidden_size,
             "input_channels": input_channels,
+            "dropout_rate": dropout_rate,
             "ignore_index": args.ignore_index,
             "image_size": image_size,
             "batch_size": args.batch_size,

@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
         help="Uncertainty estimation methods to compute (default: single).",
     )
     parser.add_argument("--stoptime_samples", type=int, default=5)
+    parser.add_argument(
+        "--mc_dropout_samples",
+        type=int,
+        default=20,
+        help="Number of stochastic forward passes for MC dropout (default: 20).",
+    )
     parser.add_argument("--stoptime_min_steps", type=int, default=None)
     parser.add_argument("--stoptime_max_steps", type=int, default=None)
     parser.add_argument("--stability_window", type=int, default=3)
@@ -280,6 +286,7 @@ def generate_uncertainty(
     fire_rate = float(ckpt_args.get("fire_rate", 0.5))
     hidden_size = int(ckpt_args.get("hidden_size", 128))
     input_channels = int(ckpt_args.get("input_channels", 3))
+    dropout_rate = float(ckpt_args.get("dropout_rate", 0.0))
     steps = args.steps or int(ckpt_args.get("steps_max", 64))
     if args.image_size:
         image_size = tuple(args.image_size)
@@ -317,9 +324,21 @@ def generate_uncertainty(
             hidden_size=hidden_size,
             input_channels=input_channels,
             steps_default=steps,
+            dropout_rate=dropout_rate,
         ).to(device)
         model.load_state_dict(checkpoint["model_state"])
         model.eval()
+        if method == "mc_dropout":
+            if dropout_rate <= 0.0:
+                print(
+                    f"[{dataset}|{method}] Skipping {checkpoint_path}: dropout is disabled. "
+                    "Train with --dropout_rate > 0 to create an MC-dropout checkpoint."
+                )
+                return
+            if args.mc_dropout_samples < 2:
+                raise ValueError("--mc_dropout_samples must be at least 2.")
+            # Keep the model in evaluation mode except for the dropout layer.
+            model.dropout.train()
 
     output_dir = (
         checkpoint_path.parent / f"uncertainty_{dataset}_{args.split}_{method}"
@@ -377,6 +396,92 @@ def generate_uncertainty(
                         "pred_mask": str(pred_path),
                         "prob_map": str(prob_path),
                         "method": method,
+                    }
+                    record.update(meta)
+                    records.append(record)
+        elif method == "mc_dropout":
+            sample_count = args.mc_dropout_samples
+            for batch_idx, (images, targets) in enumerate(loader):
+                images = images.to(device, non_blocking=True)
+                targets = sanitize_targets(
+                    targets.to(device, non_blocking=True), num_classes, args.ignore_index
+                )
+                sampled_probs: List[torch.Tensor] = []
+                for _ in range(sample_count):
+                    state = prepare_state(images, channel_n)
+                    logits_state = model(state, steps=steps)
+                    logits = select_logits(logits_state, num_classes)
+                    sampled_probs.append(torch.softmax(logits, dim=1))
+
+                stacked = torch.stack(sampled_probs, dim=0)  # K x B x C x H x W
+                mean_probs = stacked.mean(dim=0)
+                predictive_entropy = compute_entropy(mean_probs)
+                expected_entropy = -(
+                    stacked * torch.log(stacked.clamp_min(EPS))
+                ).sum(dim=2).mean(dim=0)
+                mutual_information = (predictive_entropy - expected_entropy).clamp_min(0.0)
+                var_probs = stacked.var(dim=0, unbiased=False)
+                pred_idx = torch.argmax(mean_probs, dim=1, keepdim=True)
+                preds = pred_idx.squeeze(1).cpu().numpy().astype(np.uint8)
+
+                if num_classes <= 1:
+                    prob_map = mean_probs[:, 0]
+                    variance_map = var_probs[:, 0]
+                elif num_classes == 2:
+                    prob_map = mean_probs[:, 1]
+                    variance_map = var_probs[:, 1]
+                else:
+                    prob_map = torch.gather(mean_probs, 1, pred_idx).squeeze(1)
+                    variance_map = torch.gather(var_probs, 1, pred_idx).squeeze(1)
+
+                mi_np = mutual_information.cpu().numpy()
+                entropy_np = predictive_entropy.cpu().numpy()
+                variance_np = variance_map.cpu().numpy()
+                prob_np = prob_map.cpu().numpy()
+                for i in range(mi_np.shape[0]):
+                    global_index = batch_idx * args.batch_size + i
+                    meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
+                    sample_id = meta.get("sample_id", f"sample_{global_index}")
+                    unc_map = mi_np[i]
+                    pred_mask = preds[i]
+
+                    mi_path = output_dir / f"{sample_id}_mc_dropout_mi.npy"
+                    save_entropy_map(unc_map, mi_path, args.save_png)
+                    entropy_path = output_dir / f"{sample_id}_mc_dropout_entropy.npy"
+                    np.save(entropy_path, entropy_np[i])
+                    variance_path = output_dir / f"{sample_id}_mc_dropout_variance.npy"
+                    np.save(variance_path, variance_np[i])
+                    pred_path = output_dir / f"{sample_id}_pred.npy"
+                    np.save(pred_path, pred_mask)
+                    prob_path = output_dir / f"{sample_id}_prob.npy"
+                    np.save(prob_path, prob_np[i])
+
+                    unc_mean = float(unc_map.mean())
+                    boundary = boundary_band(pred_mask.astype(bool), args.boundary_radius)
+                    if boundary.any():
+                        boundary_values = unc_map[boundary]
+                        unc_boundary_mean = float(boundary_values.mean())
+                        unc_boundary_p95 = float(np.percentile(boundary_values, 95))
+                    else:
+                        unc_boundary_mean = unc_mean
+                        unc_boundary_p95 = unc_mean
+
+                    record = {
+                        "index": global_index,
+                        "sample_id": sample_id,
+                        "unc_mean": unc_mean,
+                        "unc_boundary_mean": unc_boundary_mean,
+                        "unc_boundary_p95": unc_boundary_p95,
+                        "unc_map": str(mi_path),
+                        "mutual_information_map": str(mi_path),
+                        "entropy_map": str(entropy_path),
+                        "variance_map": str(variance_path),
+                        "variance_mean": float(variance_np[i].mean()),
+                        "pred_mask": str(pred_path),
+                        "prob_map": str(prob_path),
+                        "method": method,
+                        "mc_dropout_samples": sample_count,
+                        "dropout_rate": dropout_rate,
                     }
                     record.update(meta)
                     records.append(record)
@@ -838,6 +943,8 @@ def generate_uncertainty(
         "dataset": dataset,
         "split": args.split,
         "method": method,
+        "dropout_rate": dropout_rate,
+        "mc_dropout_samples": args.mc_dropout_samples if method == "mc_dropout" else None,
         "records": records,
         "boundary_radius": args.boundary_radius,
     }

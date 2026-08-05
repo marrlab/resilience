@@ -113,6 +113,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fire_rate", type=float, default=0.5)
     parser.add_argument("--hidden_size", type=int, default=128)
     parser.add_argument(
+        "--dropout_rate",
+        "--dropout",
+        dest="dropout_rate",
+        type=float,
+        default=0.0,
+        help=(
+            "Dropout probability in the NCA local update network. "
+            "Disabled by default; use a value such as 0.1 to train an MC-dropout baseline."
+        ),
+    )
+    parser.add_argument(
         "--input_channels",
         type=int,
         default=3,
@@ -331,6 +342,8 @@ def main() -> None:
         raise ValueError("--steps_min must be <= --steps_max.")
     if args.input_channels > args.channel_n:
         raise ValueError("--input_channels cannot exceed --channel_n.")
+    if not 0.0 <= args.dropout_rate < 1.0:
+        raise ValueError("--dropout_rate must be in the range [0, 1).")
     set_seed(args.seed)
     image_size = tuple(args.image_size) if args.image_size else None
     pin_memory = not args.no_pin_memory
@@ -356,6 +369,7 @@ def main() -> None:
         hidden_size=args.hidden_size,
         input_channels=args.input_channels,
         steps_default=args.steps_max,
+        dropout_rate=args.dropout_rate,
     ).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -366,7 +380,10 @@ def main() -> None:
     exp_name = (
         args.exp_name
         if args.exp_name
-        else f"{args.dataset}_nca_c{args.channel_n}_s{args.steps_min}-{args.steps_max}"
+        else (
+            f"{args.dataset}_nca_c{args.channel_n}_s{args.steps_min}-{args.steps_max}"
+            + (f"_dropout{args.dropout_rate:g}" if args.dropout_rate > 0.0 else "")
+        )
     )
     exp_dir = Path("runs") / exp_name
     if exp_dir.exists():

@@ -197,6 +197,7 @@ def generate_quality_labels(
     fire_rate = float(ckpt_args.get("fire_rate", 0.5))
     hidden_size = int(ckpt_args.get("hidden_size", 128))
     input_channels = int(ckpt_args.get("input_channels", 3))
+    dropout_rate = float(ckpt_args.get("dropout_rate", 0.0))
     steps = args.steps or int(ckpt_args.get("steps_max", 64))
 
     if args.image_size:
@@ -231,6 +232,7 @@ def generate_quality_labels(
         hidden_size=hidden_size,
         input_channels=input_channels,
         steps_default=steps,
+        dropout_rate=dropout_rate,
     ).to(device)
     model.load_state_dict(checkpoint["model_state"])
     model.eval()
