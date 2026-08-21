@@ -401,6 +401,46 @@ def _resolve_promise12_root(root: Optional[Path]) -> Path:
     )
 
 
+def _resolve_raabin_nc_root(root: Optional[Path]) -> Path:
+    candidates: Iterable[Path]
+    if root:
+        candidates = (root,)
+    else:
+        candidates = (
+            Path(
+                "datasets/raabin/WBCData/Index of WBC Data/"
+                "Index of WBC nucleus_cytoplasm_GT/GroundTruths_bmpformat"
+            ),
+            Path("datasets/raabin_nc"),
+            Path("datasets/raabin-nc"),
+        )
+
+    def _has_split_dirs(path: Path) -> bool:
+        return (path / "Train_bmp").exists() and (path / "Train_GT_bmp").exists()
+
+    for candidate in candidates:
+        candidate = candidate.expanduser().resolve()
+        if _has_split_dirs(candidate):
+            return candidate
+        nested = candidate / "GroundTruths_bmpformat"
+        if _has_split_dirs(nested):
+            return nested
+    for base in (Path("datasets/raabin"), Path("datasets/raabin_nc"), Path("datasets/raabin-nc")):
+        base = base.expanduser()
+        if not base.exists():
+            continue
+        for match in sorted(base.rglob("GroundTruths_bmpformat")):
+            if _has_split_dirs(match):
+                return match.resolve()
+    raise FileNotFoundError(
+        "Unable to locate the Raabin-WBC nucleus/cytoplasm ground truth. Expected a "
+        "GroundTruths_bmpformat directory with Train_bmp/Train_GT_bmp and "
+        "Test_bmp/Test_GT_bmp subfolders (e.g. under "
+        "datasets/raabin/WBCData/Index of WBC Data/"
+        "Index of WBC nucleus_cytoplasm_GT/GroundTruths_bmpformat)."
+    )
+
+
 def _split_cases(
     items: Sequence[Path], val_ratio: float, test_ratio: float
 ) -> Dict[str, List[Path]]:
@@ -1480,6 +1520,98 @@ class RaabinWBCDataset(Dataset):
         return _apply_shared_transforms(image, mask_img, self.image_size, self.augment)
 
 
+_RAABIN_NC_NUCLEUS_VALUE = 100
+_RAABIN_NC_CYTOPLASM_VALUE = 255
+
+
+def _raabin_nc_encode_mask(mask_path: Path) -> Image.Image:
+    """Map the raw BMP GT (0=bg, 100=nucleus, 255=cytoplasm) to class indices 0/1/2."""
+    arr = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+    encoded = np.zeros_like(arr, dtype=np.uint8)
+    encoded[arr == _RAABIN_NC_NUCLEUS_VALUE] = 1
+    encoded[arr == _RAABIN_NC_CYTOPLASM_VALUE] = 2
+    return Image.fromarray(encoded, mode="L")
+
+
+def _raabin_nc_has_cytoplasm_split(mask_path: Path) -> bool:
+    arr = np.array(Image.open(mask_path).convert("L"), dtype=np.uint8)
+    return bool(np.any(arr == _RAABIN_NC_NUCLEUS_VALUE))
+
+
+def _list_raabin_nc_pairs(images_dir: Path, masks_dir: Path) -> List[Tuple[Path, Path]]:
+    _ensure_exists(images_dir, "Raabin nucleus/cytoplasm images directory")
+    _ensure_exists(masks_dir, "Raabin nucleus/cytoplasm annotations directory")
+    pairs = _match_image_label_paths(images_dir, masks_dir)
+    # Some GT masks only outline the whole cell (values 0/255, no separate nucleus
+    # label) rather than splitting it into nucleus/cytoplasm; skip those so the
+    # nucleus and cytoplasm classes stay correctly labeled.
+    filtered = [
+        (image_path, mask_path)
+        for image_path, mask_path in pairs
+        if _raabin_nc_has_cytoplasm_split(mask_path)
+    ]
+    if not filtered:
+        raise RuntimeError(
+            f"No samples with separate nucleus/cytoplasm annotations found in {masks_dir}."
+        )
+    return filtered
+
+
+def _split_raabin_nc_train_val(
+    pairs: List[Tuple[Path, Path]], val_ratio: float
+) -> Dict[str, List[Tuple[Path, Path]]]:
+    ordered = sorted(pairs, key=lambda pair: pair[0].stem)
+    total = len(ordered)
+    val_count = min(max(total - 1, 0), max(1, int(round(total * val_ratio)))) if val_ratio > 0 else 0
+    train_count = total - val_count
+    return {"train": ordered[:train_count], "val": ordered[train_count:]}
+
+
+class RaabinNucleusCytoplasmDataset(Dataset):
+    """Raabin-WBC nucleus/cytoplasm segmentation from the GroundTruths_bmpformat GT.
+
+    Unlike RaabinWBCDataset (whole-cell binary mask), this dataset segments each
+    white blood cell into background/nucleus/cytoplasm, matching how VOC/CamVid
+    handle multi-class targets: only a light live flip augmentation is applied
+    (no offline *_aug split), since the underlying masks are not binary.
+    """
+
+    class_names = ["background", "nucleus", "cytoplasm"]
+    num_classes = 3
+
+    def __init__(
+        self,
+        root: Optional[Path],
+        split: str,
+        image_size: Optional[Tuple[int, int]] = None,
+        augment: bool = False,
+        val_ratio: float = 0.1,
+    ) -> None:
+        nc_root = _resolve_raabin_nc_root(root)
+        split_key = split.lower()
+        if split_key not in {"train", "val", "test"}:
+            raise ValueError("Raabin nucleus/cytoplasm supports 'train', 'val', or 'test' splits.")
+        if split_key == "test":
+            samples = _list_raabin_nc_pairs(nc_root / "Test_bmp", nc_root / "Test_GT_bmp")
+        else:
+            train_pairs = _list_raabin_nc_pairs(nc_root / "Train_bmp", nc_root / "Train_GT_bmp")
+            samples = _split_raabin_nc_train_val(train_pairs, val_ratio=val_ratio)[split_key]
+        if not samples:
+            raise RuntimeError(f"No Raabin nucleus/cytoplasm samples for split '{split_key}'.")
+        self.samples = samples
+        self.image_size = image_size
+        self.augment = augment
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        image_path, mask_path = self.samples[idx]
+        image = Image.open(image_path).convert("RGB")
+        mask = _raabin_nc_encode_mask(mask_path)
+        return _apply_shared_transforms(image, mask, self.image_size, self.augment)
+
+
 def _maybe_subset(dataset: Dataset, subset_size: Optional[int]) -> Dataset:
     if subset_size is None or subset_size <= 0 or subset_size >= len(dataset):
         return dataset
@@ -1610,6 +1742,15 @@ def build_dataset(
         if base_split not in {"train", "val", "test"}:
             raise ValueError("Raabin-WBC supports 'train', 'val', 'test', or *_aug splits.")
         dataset = RaabinWBCDataset(
+            root=root_path,
+            split=split,
+            image_size=image_size,
+            augment=augment,
+        )
+    elif dataset_name == "raabin_nc":
+        if split not in {"train", "val", "test"}:
+            raise ValueError("Raabin nucleus/cytoplasm supports 'train', 'val', or 'test' splits.")
+        dataset = RaabinNucleusCytoplasmDataset(
             root=root_path,
             split=split,
             image_size=image_size,

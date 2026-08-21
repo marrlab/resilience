@@ -13,11 +13,10 @@ def collect_metrics(runs_root: Path) -> dict[str, dict[str, list[float]]]:
         if not run_dir.is_dir():
             continue
         for metrics_path in run_dir.glob("eval_*_test/metrics.json"):
-            try:
-                dataset = metrics_path.parent.name.split("_")[1]
-            except IndexError:
-                continue
             data = json.loads(metrics_path.read_text())
+            dataset = data.get("dataset")
+            if not dataset:
+                continue
             metrics = data.get("metrics", {})
             bucket = datasets.setdefault(dataset, {k: [] for k in METRIC_KEYS})
             for key in METRIC_KEYS:

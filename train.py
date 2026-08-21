@@ -53,6 +53,11 @@ DATASET_DEFAULT_ROOTS = {
         "datasets/raabin-wbc",
         "datasets/raabin",
     ],
+    "raabin_nc": [
+        "datasets/raabin/WBCData/Index of WBC Data/"
+        "Index of WBC nucleus_cytoplasm_GT/GroundTruths_bmpformat",
+        "datasets/raabin_nc",
+    ],
 }
 
 
@@ -73,6 +78,7 @@ def parse_args() -> argparse.Namespace:
             "drive",
             "promise12",
             "raabin",
+            "raabin_nc",
         ],
         required=True,
         help="Dataset to use.",
@@ -430,6 +436,7 @@ def main() -> None:
                 "dice": val_metrics["dice"],
             }
         )
+        exp_dir.mkdir(parents=True, exist_ok=True)
         with open(metrics_file, "w", encoding="utf-8") as f:
             json.dump(history, f, indent=2)
         is_best = val_metrics["miou"] > best_miou
