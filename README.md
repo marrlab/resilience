@@ -210,3 +210,114 @@ The repository includes SLURM helpers such as `run_dsb2018.sbatch`, `run_monuseg
 ## Citation & License
 
 This repository is part of an ongoing NCA-based uncertainty study. Please contact the maintainers for up-to-date citation and licensing information before redistributing or publishing results derived from this codebase.
+
+## Single and Double Resilience Perturbations
+
+Both compute_uncertainty.py and ablation_sweep.py accept:
+
+| Option | Meaning |
+|---|---|
+| --resilience_mode single | One injection, followed by one recovery stage (default). |
+| --resilience_mode double | Two sequential injections, each followed by a recovery stage. |
+| --resilience_mode both | Save single and double results from the same original state and first recovery. |
+| --no_perturb_rgb | Add noise only to non-input channels; keep original RGB fixed (default). |
+| --perturb_rgb | Add noise to all channels, including RGB/input channels. |
+
+The original prediction is always obtained with the original RGB held fixed.
+During each recovery stage the input channels are clamped to that stage's input:
+original RGB for latent-only noise, or noisy RGB when RGB noise is enabled.
+In double RGB mode, the second fresh noise is added to the already recovered
+state, including its previously perturbed RGB. No clipping is applied to Gaussian
+noise. This keeps the RGB perturbation effective instead of immediately restoring
+the original image, and avoids unconstrained RGB drift from learned updates.
+
+For initial rollout length T and recovery length T':
+
+- Single: inject at T, recover T' updates, evaluate at T + T'.
+- Double: inject at T, recover T' updates, inject again at T + T',
+  recover another T' updates, evaluate at T + 2T'.
+- Each injection uses independent Gaussian noise with the same standard deviation.
+- Both endpoints are compared to the original mask at T using 1 - IoU.
+- --resilience_relax_steps (computation) and each --t_primes value (ablation)
+  mean recovery steps **per injection**, not the total recovery budget.
+
+Compute paired single/double results without RGB noise:
+
+~~~powershell
+python compute_uncertainty.py --datasets dsb2018 --split test --methods resilience --resilience_mode both --no_perturb_rgb --resilience_noise 0.02 --resilience_relax_steps 12 --seed 42
+~~~
+
+Compute the corresponding paired results with RGB noise:
+
+~~~powershell
+python compute_uncertainty.py --datasets dsb2018 --split test --methods resilience --resilience_mode both --perturb_rgb --resilience_noise 0.02 --resilience_relax_steps 12 --seed 42
+~~~
+
+Results use distinct method IDs:
+
+| Mode | Without RGB noise | With RGB noise |
+|---|---|---|
+| Single | resilience_single_latent | resilience_single_rgb |
+| Double | resilience_double_latent | resilience_double_rgb |
+
+The directory and JSON filename follow the existing convention, for example
+runs/<run>/uncertainty_dsb2018_test_resilience_double_latent/uncertainty_dsb2018_test_resilience_double_latent.json.
+The old ..._resilience outputs are left in place. Repeating the same configuration
+overwrites its own output; use separate run folders to retain different seeds or
+noise/recovery settings.
+
+Evaluate all four variants together after computing both RGB settings:
+
+~~~powershell
+python evaluate_uncertainty.py --datasets dsb2018 --split test --methods resilience_single_latent resilience_double_latent resilience_single_rgb resilience_double_rgb --output runs/unc_summary_resilience_comparison_test.json
+~~~
+
+New resilience records include Dice and boundary F1 measured on the exact
+original mask being probed. Evaluation uses these values even if a separate
+quality file contains a different stochastic prediction. New resilience outputs
+can therefore be evaluated without first generating quality_*.json.
+Other uncertainty methods continue to require their quality-label files.
+
+pred_mask and prob_map describe the original prediction.
+recovered_pred_mask and recovered_prob_map describe the selected endpoint.
+unc_map is the pixel-wise mask disagreement; the ranking score remains the
+scalar 1 - IoU, stored in the existing uncertainty-score fields.
+Saved frames and labels identify both injections and their recovery stages.
+JSON metadata records the selected mode, RGB choice, seed, noise magnitude,
+injection times and final evaluation time.
+
+Run the paired ablation grid:
+
+~~~powershell
+python ablation_sweep.py --checkpoint runs/dsb2018_baseline/best.pt --dataset dsb2018 --resilience_mode both --no_perturb_rgb --sigmas 0.02 --t_primes 12 --seed 42 --output runs/ablation_resilience_latent.json
+~~~
+
+Repeat with --perturb_rgb and a different output filename for the RGB comparison.
+Grid entries include both their method ID and parameters, and contain per-image
+scores and original Dice. Every sample in a batch is scored. AUROC is recorded
+as null if the evaluation set contains only one quality class.
+
+Baseline, injection and recovery randomness are isolated. With the same checkpoint,
+dataset order, batch size, image size, rollout settings and seed, standalone
+single/double runs match their endpoints in both mode. Additional recovery steps
+do not change the random sequence used for later images. Keep these settings
+identical across comparisons. The same seed also pairs the latent noise between
+RGB settings. Fire masks are reproducible, but GPU reproducibility across hardware
+or different PyTorch builds is not guaranteed.
+
+The corrected rollout does not reproduce the old compute_uncertainty.py
+resilience branch exactly: that branch perturbed all channels and allowed RGB to
+evolve without clamping, including during the initial rollout. Existing checkpoints
+remain compatible; no retraining is needed. Recompute inference results for the
+new comparisons.
+
+For a journal comparison, additionally run single perturbation with twice the
+recovery length to control for the extra update budget in double mode.
+Plotting/evaluation scripts accept the saved method IDs via --methods; the
+visualization tool creates separate GIFs with injection labels for each variant.
+
+Run the focused regression tests with:
+
+~~~powershell
+python -m unittest discover -s tests -p "test_resilience.py" -v
+~~~

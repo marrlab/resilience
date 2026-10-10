@@ -178,8 +178,13 @@ def build_figure(image: np.ndarray, gt_mask: np.ndarray, method_maps: List[Tuple
     print(f"[visualize_uncertainty] Saved figure to {output_path}")
 
 
-def create_resilience_gif(image: np.ndarray, frames_path: Path, output_path: Path) -> None:
+def create_resilience_gif(
+    image: np.ndarray, frames_path: Path, output_path: Path,
+    frame_labels: Optional[List[str]] = None,
+) -> None:
     frames = np.load(frames_path)
+    if frame_labels is not None and len(frame_labels) != len(frames):
+        raise ValueError("Resilience frame labels must match the saved frame count.")
 
     def overlay_mask(mask: np.ndarray, color: Tuple[int, int, int], label: str) -> Image.Image:
         mask_resized = mask
@@ -197,7 +202,9 @@ def create_resilience_gif(image: np.ndarray, frames_path: Path, output_path: Pat
 
     gif_frames: List[Image.Image] = []
     for idx, mask in enumerate(frames):
-        if idx == 0:
+        if frame_labels is not None:
+            label = frame_labels[idx]
+        elif idx == 0:
             label = "Baseline"
         else:
             label = f"Relax step {idx}"
@@ -230,7 +237,7 @@ def main() -> None:
     gt_mask = load_mask_from_metadata(quality_rec, image_np.shape[:2])
 
     method_maps: List[Tuple[str, np.ndarray, float]] = []
-    resilience_frames_path: Optional[Path] = None
+    resilience_animations = []
     for method in args.methods:
         try:
             rec = load_uncertainty_record(run_dir, args.dataset, args.split, method, sample_id)
@@ -243,12 +250,12 @@ def main() -> None:
             continue
         heatmap = np.load(map_path)
         method_maps.append((method, heatmap, rec.get("unc_boundary_mean")))
-        if method == "resilience":
+        if method == "resilience" or method.startswith("resilience_"):
             frames_path = rec.get("resilience_frames")
             if frames_path:
                 p = Path(frames_path)
                 if p.exists():
-                    resilience_frames_path = p
+                    resilience_animations.append((method, p, rec.get("resilience_frame_labels")))
 
     if not method_maps:
         raise RuntimeError("No uncertainty methods available for plotting.")
@@ -257,9 +264,10 @@ def main() -> None:
     fig_path = output_dir / f"{args.dataset}_{sample_id}_{args.split}_uncertainty.png"
     build_figure(image_np, gt_mask, method_maps, fig_path, args.figure_dpi)
 
-    if args.create_gif and resilience_frames_path:
-        gif_path = output_dir / f"{args.dataset}_{sample_id}_{args.split}_resilience.gif"
-        create_resilience_gif(image_np, resilience_frames_path, gif_path)
+    if args.create_gif:
+        for method, frames_path, labels in resilience_animations:
+            gif_path = output_dir / f"{args.dataset}_{sample_id}_{args.split}_{method}.gif"
+            create_resilience_gif(image_np, frames_path, gif_path, labels)
 
 
 if __name__ == "__main__":

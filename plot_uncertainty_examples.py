@@ -160,7 +160,7 @@ def plot_examples(dataset: str, records: List[Dict], output_dir: Path, split: st
             f"{rec.get('sample_id','sample')} (Dice {rec.get('dice',0):.2f})",
             "Ground Truth",
             "Prediction",
-            f"Entropy (unc={rec['unc_boundary_mean']:.2f})",
+            f"Uncertainty (unc={rec['unc_boundary_mean']:.2f})",
         ]
         visuals = [image_np, gt, pred, entropy]
         cmaps = [None, "gray", "gray", "magma"]

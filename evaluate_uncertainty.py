@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         nargs="+",
         default=["single"],
-        help="Uncertainty estimation methods to evaluate.",
+        help="Saved method IDs, e.g. resilience_single_latent resilience_double_latent (or *_rgb).",
     )
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument(
@@ -98,12 +98,18 @@ def load_records(run_dir: Path, dataset: str, split: str, method: str) -> Tuple[
     quality_path = run_dir / f"quality_{dataset}_{split}.json"
     unc_dir = run_dir / f"uncertainty_{dataset}_{split}_{method}"
     unc_path = unc_dir / f"uncertainty_{dataset}_{split}_{method}.json"
-    if not quality_path.exists() or not unc_path.exists():
+    if not unc_path.exists():
         raise FileNotFoundError(
-            f"Missing quality or uncertainty files for {dataset} {split} under {run_dir}"
+            f"Missing uncertainty file for {dataset} {split} {method} under {run_dir}"
         )
-    q = load_json(quality_path)["records"]
     u = load_json(unc_path)["records"]
+    if quality_path.exists():
+        q = load_json(quality_path)["records"]
+    elif u and all(rec.get("quality_source") == "resilience_baseline" and "dice" in rec for rec in u):
+        # New resilience results contain quality for their exact original masks.
+        q = u
+    else:
+        raise FileNotFoundError(f"Missing quality labels: {quality_path}")
     return q, u
 
 
@@ -372,9 +378,6 @@ def load_and_prepare_records(
     skip_empty: bool,
     min_pred_fraction: float,
 ) -> Optional[List[Dict]]:
-    quality_path = exp_dir / f"quality_{dataset}_{split}.json"
-    if not quality_path.exists():
-        return None
     try:
         quality, uncertainty = load_records(exp_dir, dataset, split, method)
     except FileNotFoundError:

@@ -21,7 +21,13 @@ from evaluate import (
     select_logits,
     sanitize_targets,
     DATASET_DEFAULT_ROOTS,
+    boundary_f1_score,
 )
+from resilience import (
+    add_resilience_arguments, experiment_seed, isolated_rng, perturb_and_recover,
+    result_method, rollout_metadata, selected_modes, validate_parameters,
+)
+
 EPS = 1e-6
 IMAGE_EXTENSIONS = {".tif", ".tiff", ".png", ".jpg", ".jpeg"}
 
@@ -99,8 +105,9 @@ def parse_args() -> argparse.Namespace:
         "--resilience_relax_steps",
         type=int,
         default=12,
-        help="Number of relaxation steps for resilience uncertainty.",
+        help="Recovery steps after each resilience injection (double uses twice this many).",
     )
+    add_resilience_arguments(parser)
     parser.add_argument(
         "--tta_max_transforms",
         type=int,
@@ -277,17 +284,136 @@ def save_entropy_map(entropy: np.ndarray, path: Path, save_png: bool) -> None:
         Image.fromarray((norm * 255).astype(np.uint8)).save(path.with_suffix(".png"))
 
 
+def generate_resilience(
+    args: argparse.Namespace, dataset: str, checkpoint_path: Path,
+    model: BackboneNCA, loader, num_classes: int, sample_meta: List[Dict],
+    steps: int, device: torch.device,
+) -> None:
+    """Save paired single/double scores against the exact original prediction."""
+    if num_classes != 2:
+        raise ValueError("Resilience currently supports binary (two-logit) segmentation.")
+    if steps < 1:
+        raise ValueError("--steps must be at least 1.")
+    validate_parameters(args.resilience_noise, args.resilience_relax_steps)
+    modes = selected_modes(args.resilience_mode)
+    records = {mode: [] for mode in modes}
+    output_dirs = {}
+    for mode in modes:
+        method = result_method(mode, args.perturb_rgb)
+        output_dirs[mode] = checkpoint_path.parent / f"uncertainty_{dataset}_{args.split}_{method}"
+        output_dirs[mode].mkdir(parents=True, exist_ok=True)
+
+    def readout(current):
+        logits = select_logits(current, num_classes)
+        probs = torch.softmax(logits, dim=1)
+        return probs.argmax(dim=1).cpu().numpy().astype(np.uint8), probs[:, 1].cpu().numpy()
+
+    global_offset = 0
+    with torch.no_grad():
+        for images, targets in loader:
+            images = images.to(device, non_blocking=True)
+            targets = sanitize_targets(
+                targets.to(device, non_blocking=True), num_classes, args.ignore_index
+            ).cpu().numpy()
+            baseline_seed = experiment_seed(args.seed, dataset, global_offset, "baseline")
+            resilience_seed = experiment_seed(args.seed, dataset, global_offset, "perturbation")
+            state = prepare_state(images, model.channel_n)
+            conditioning = state[..., :model.input_channels].clone()
+            with isolated_rng(baseline_seed, device):
+                state = model(state, steps=steps, conditioning=conditioning)
+            pred_mask, prob_map = readout(state)
+            frame_buffers = [[mask.copy()] for mask in pred_mask]
+            frame_labels = ["Baseline"]
+            injection_frame_indices = []
+
+            def record_frame(current, cycle, recovery_step):
+                masks, _ = readout(current)
+                if recovery_step == 0:
+                    injection_frame_indices.append(len(frame_labels))
+                    frame_labels.append(f"Perturbation {cycle}")
+                else:
+                    frame_labels.append(f"Recovery {cycle}: step {recovery_step}")
+                for buffer, mask in zip(frame_buffers, masks):
+                    buffer.append(mask.copy())
+
+            for mode, recovered in perturb_and_recover(
+                model, state, args.resilience_noise, args.resilience_relax_steps,
+                args.resilience_mode, args.perturb_rgb, resilience_seed, record_frame,
+            ):
+                recovered_masks, recovered_probs = readout(recovered)
+                output_dir = output_dirs[mode]
+                method = result_method(mode, args.perturb_rgb)
+                metadata = rollout_metadata(mode, args.perturb_rgb, steps, args.resilience_relax_steps)
+                for i, mask_a in enumerate(pred_mask):
+                    global_index = global_offset + i
+                    meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
+                    sample_id = str(meta.get("sample_id", f"sample_{global_index}"))
+                    mask_b = recovered_masks[i]
+                    intersection = np.logical_and(mask_a, mask_b).sum()
+                    union = np.logical_or(mask_a, mask_b).sum()
+                    score = 1.0 - (float(intersection / union) if union else 1.0)
+                    # Quality is measured on precisely the baseline this score probes.
+                    target = targets[i]
+                    valid = target != args.ignore_index
+                    target_mask = (target > 0) & valid
+                    prediction = mask_a.astype(bool) & valid
+                    total = target_mask.sum() + prediction.sum()
+                    dice = float(2 * np.logical_and(target_mask, prediction).sum() / total) if total else 1.0
+                    paths = {
+                        "unc_map": output_dir / f"{sample_id}_resilience.npy",
+                        "pred_mask": output_dir / f"{sample_id}_pred.npy",
+                        "prob_map": output_dir / f"{sample_id}_prob.npy",
+                        "recovered_pred_mask": output_dir / f"{sample_id}_recovered_pred.npy",
+                        "recovered_prob_map": output_dir / f"{sample_id}_recovered_prob.npy",
+                        "resilience_frames": output_dir / f"{sample_id}_resilience_frames.npy",
+                    }
+                    np.save(paths["unc_map"], (mask_a != mask_b).astype(np.uint8))
+                    np.save(paths["pred_mask"], mask_a)
+                    np.save(paths["prob_map"], prob_map[i])
+                    np.save(paths["recovered_pred_mask"], mask_b)
+                    np.save(paths["recovered_prob_map"], recovered_probs[i])
+                    np.save(paths["resilience_frames"], np.stack(frame_buffers[i], axis=0))
+                    records[mode].append({
+                        **meta, **metadata,
+                        "index": global_index, "sample_id": sample_id, "method": method,
+                        "unc_mean": score, "unc_boundary_mean": score, "unc_boundary_p95": score,
+                        **{key: str(path) for key, path in paths.items()},
+                        "dice": dice,
+                        "boundary_f1": float(boundary_f1_score(target_mask, prediction)),
+                        "quality_source": "resilience_baseline",
+                        "baseline_seed": baseline_seed, "resilience_seed": resilience_seed,
+                        "resilience_frame_labels": list(frame_labels),
+                        "injection_frame_indices": list(injection_frame_indices),
+                    })
+            global_offset += len(pred_mask)
+
+    for mode in modes:
+        method = result_method(mode, args.perturb_rgb)
+        summary = {
+            "checkpoint": str(checkpoint_path), "dataset": dataset, "split": args.split,
+            "method": method, "seed": args.seed, "batch_size": args.batch_size,
+            "resilience_noise": args.resilience_noise,
+            "dropout_rate": model.dropout_rate, "boundary_radius": args.boundary_radius,
+            **rollout_metadata(mode, args.perturb_rgb, steps, args.resilience_relax_steps),
+            "records": records[mode],
+        }
+        path = output_dirs[mode] / f"uncertainty_{dataset}_{args.split}_{method}.json"
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print(f"[{dataset}|{method}] Saved {len(records[mode])} uncertainty entries to {output_dirs[mode]}")
+
+
 def generate_uncertainty(
     args: argparse.Namespace, dataset: str, checkpoint_path: Path, method: str
 ) -> None:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     ckpt_args = checkpoint.get("args", {})
     channel_n = int(ckpt_args.get("channel_n", 64))
     fire_rate = float(ckpt_args.get("fire_rate", 0.5))
     hidden_size = int(ckpt_args.get("hidden_size", 128))
     input_channels = int(ckpt_args.get("input_channels", 3))
     dropout_rate = float(ckpt_args.get("dropout_rate", 0.0))
-    steps = args.steps or int(ckpt_args.get("steps_max", 64))
+    steps = args.steps if args.steps is not None else int(ckpt_args.get("steps_max", 64))
     if args.image_size:
         image_size = tuple(args.image_size)
     else:
@@ -339,6 +465,10 @@ def generate_uncertainty(
                 raise ValueError("--mc_dropout_samples must be at least 2.")
             # Keep the model in evaluation mode except for the dropout layer.
             model.dropout.train()
+
+    if method == "resilience":
+        generate_resilience(args, dataset, checkpoint_path, model, loader, num_classes, sample_meta, steps, device)
+        return
 
     output_dir = (
         checkpoint_path.parent / f"uncertainty_{dataset}_{args.split}_{method}"
@@ -705,90 +835,6 @@ def generate_uncertainty(
                     }
                     record.update(meta)
                     records.append(record)
-        elif method == "resilience":
-            noise_std = args.resilience_noise
-            relax_steps = args.resilience_relax_steps
-            for batch_idx, (images, targets) in enumerate(loader):
-                images = images.to(device, non_blocking=True)
-                targets = sanitize_targets(
-                    targets.to(device, non_blocking=True), num_classes, args.ignore_index
-                )
-                state = prepare_state(images, channel_n)
-                for _ in range(steps):
-                    state = model.update(state, fire_rate=None)
-                logits = select_logits(state, num_classes)
-                probs = torch.softmax(logits, dim=1).cpu().numpy()
-                if num_classes <= 1:
-                    prob_map = probs[:, 0]
-                    pred_mask = prob_map >= 0.5
-                elif num_classes == 2:
-                    prob_map = probs[:, 1]
-                    pred_mask = prob_map >= 0.5
-                else:
-                    prob_map = probs.max(axis=1)
-                    pred_mask = probs.argmax(axis=1)
-
-                frame_buffers: List[List[np.ndarray]] = [
-                    [pred_mask[i].astype(np.uint8)] for i in range(pred_mask.shape[0])
-                ]
-
-                perturbed_state = state.clone()
-                noise = torch.randn_like(perturbed_state) * noise_std
-                perturbed_state = perturbed_state + noise
-
-                probs_relaxed: np.ndarray = prob_map
-                pred_relaxed: np.ndarray = pred_mask
-
-                for relax_idx in range(relax_steps + 1):
-                    logits_relaxed = select_logits(perturbed_state, num_classes)
-                    probs_relaxed = torch.softmax(logits_relaxed, dim=1).cpu().numpy()
-                    if num_classes <= 1:
-                        pred_relaxed = probs_relaxed[:, 0] >= 0.5
-                    elif num_classes == 2:
-                        pred_relaxed = probs_relaxed[:, 1] >= 0.5
-                    else:
-                        pred_relaxed = probs_relaxed.argmax(axis=1)
-                    for buffer, mask_frame in zip(frame_buffers, pred_relaxed):
-                        buffer.append(mask_frame.astype(np.uint8))
-                    if relax_idx < relax_steps:
-                        perturbed_state = model.update(perturbed_state, fire_rate=None)
-
-                if num_classes <= 1:
-                    prob_relaxed_final = probs_relaxed[:, 0]
-                elif num_classes == 2:
-                    prob_relaxed_final = probs_relaxed[:, 1]
-                else:
-                    prob_relaxed_final = probs_relaxed.max(axis=1)
-
-                for i in range(prob_map.shape[0]):
-                    global_index = batch_idx * args.batch_size + i
-                    meta = sample_meta[global_index] if global_index < len(sample_meta) else {}
-                    sample_id = meta.get("sample_id", f"sample_{global_index}")
-                    mask_a = pred_mask[i].astype(np.uint8)
-                    mask_b = pred_relaxed[i].astype(np.uint8)
-                    intersection = np.logical_and(mask_a, mask_b).sum()
-                    union = np.logical_or(mask_a, mask_b).sum()
-                    iou = intersection / union if union > 0 else 1.0
-                    unc_resilience = 1.0 - iou
-                    frames_path = output_dir / f"{sample_id}_resilience_frames.npy"
-                    np.save(frames_path, np.stack(frame_buffers[i], axis=0))
-                    record = {
-                        "index": global_index,
-                        "sample_id": sample_id,
-                        "unc_mean": float(unc_resilience),
-                        "unc_boundary_mean": float(unc_resilience),
-                        "unc_boundary_p95": float(unc_resilience),
-                        "unc_map": str(output_dir / f"{sample_id}_resilience.npy"),
-                        "pred_mask": str(output_dir / f"{sample_id}_pred.npy"),
-                        "prob_map": str(output_dir / f"{sample_id}_prob.npy"),
-                        "resilience_frames": str(frames_path),
-                        "method": method,
-                    }
-                    np.save(output_dir / f"{sample_id}_resilience.npy", mask_a.astype(np.uint8))
-                    np.save(output_dir / f"{sample_id}_pred.npy", mask_b)
-                    np.save(output_dir / f"{sample_id}_prob.npy", prob_relaxed_final[i])
-                    record.update(meta)
-                    records.append(record)
         elif method == "tta":
             transforms = _default_tta_transforms()
             if args.tta_max_transforms is not None:
@@ -957,6 +1003,8 @@ def generate_uncertainty(
 
 def main() -> None:
     args = parse_args()
+    if "resilience" in args.methods:
+        validate_parameters(args.resilience_noise, args.resilience_relax_steps)
     set_seed(args.seed)
     runs_dir = Path(args.runs_dir)
     if not runs_dir.exists():
