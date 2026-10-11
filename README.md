@@ -321,3 +321,111 @@ Run the focused regression tests with:
 ~~~powershell
 python -m unittest discover -s tests -p "test_resilience.py" -v
 ~~~
+
+## Calibration of Segmentation Failure Probabilities
+
+Use plot_calibration.py after computing per-image uncertainty results for both
+validation and test. The script fits a separate mapping for each dataset, run and
+saved method ID; it does not pool different checkpoints or change NCA weights.
+
+Failure is defined as **original-prediction Dice < --failure_threshold**.
+The default threshold is 0.8, matching ablation_sweep.py's default. The existing
+evaluate_uncertainty.py instead labels the lowest-Dice quantile as failures, so
+its AUROC can differ. This script recomputes AUROC using the same fixed failure
+definition as the calibration plot. Choose the threshold before inspecting test
+results.
+
+First generate paired validation and test results using identical inference
+settings (including noise magnitude, recovery length and RGB choice):
+
+~~~powershell
+python compute_uncertainty.py --datasets dsb2018 --split val --methods resilience --resilience_mode both --no_perturb_rgb --resilience_noise 0.02 --resilience_relax_steps 12
+python compute_uncertainty.py --datasets dsb2018 --split test --methods resilience --resilience_mode both --no_perturb_rgb --resilience_noise 0.02 --resilience_relax_steps 12
+~~~
+
+Plot the single/double comparison with the logistic baseline:
+
+~~~powershell
+python plot_calibration.py --datasets dsb2018 --methods resilience_single_latent resilience_double_latent --calibration_split val --split test --failure_threshold 0.8 --n_bins 10 --calibrator logistic --output runs/calibration
+~~~
+
+Both --dataset and --datasets accept one or more dataset names. --runs_dir uses
+the existing runs/<dataset>_* convention; --run_name restricts analysis to one
+run. Use the corresponding *_rgb method IDs after generating RGB-noise results.
+Legacy methods such as resilience and single are also supported when their
+matching quality_<dataset>_<split>.json contains original-prediction Dice.
+
+New resilience files already contain exact baseline Dice. That value takes
+precedence over separate quality-label files. The script refuses duplicate IDs,
+missing Dice, invalid values, detected validation/test sample or group overlap,
+and conflicting saved protocol settings. Missing result pairs are skipped.
+Legacy files may lack enough metadata to verify the full protocol; the output
+records which checks could not be made. Split-local numeric indices alone cannot
+prove sample independence.
+
+The default calibrator learns p(failure | u) = sigmoid(a*u + b) on validation.
+Logistic regression uses standardized scores and fixed L2 regularization C=1;
+--logistic_c changes this value. The saved coefficients a and b apply directly
+to the original uncertainty scale. No class balancing is applied, since failure
+prevalence must be retained. Both failure classes must occur in the calibration
+set; the script refuses to fit if validation has only successes or only failures.
+
+Use --calibrator auto to compare logistic and increasing isotonic regression by
+cross-validation **within validation**, then refit the selected mapping on all
+validation images. Selection uses --selection_metric brier (default) or log_loss.
+By default isotonic is considered only with at least 100 validation images and
+10 examples of each failure class; these are configurable practical thresholds,
+not guarantees against overfitting. Insufficient data or unusable group folds
+fall back to logistic. --calibrator isotonic explicitly fits isotonic without
+automatic selection.
+
+Calibration plots use 10 quantile bins by default; choose --n_bins 5 for smaller
+test sets, or --strategy uniform for equal-width probability bins. Binning follows
+[scikit-learn calibration_curve](https://scikit-learn.org/stable/modules/generated/sklearn.calibration.calibration_curve.html).
+Tied probabilities stay together, and empty bins are omitted, so fewer than the
+requested number of plotted points can occur. Labels show failures/image count.
+The horizontal axis is mean predicted failure probability; the vertical axis is
+observed failure fraction. A second panel shows the test probability histogram.
+
+Each run produces:
+
+- runs/calibration/<run>/<dataset>_<split>_calibration.png
+- runs/calibration/<run>/<dataset>_<split>_calibration.pdf
+- runs/calibration/<run>/calibration_<dataset>_<split>_<method>.json for every method
+
+The JSON contains fitted mapping parameters, validation CV scores, test Brier
+score/log loss/ECE, raw-uncertainty AUROC, calibrated-probability AUROC, per-bin
+counts/failures/confidence intervals, validation u/Dice/failure records, and
+test u/Dice/failure/predicted-probability records. AUROC is null if the test set
+has only one outcome class. ECE depends on binning and is descriptive; it is not
+used to select a mapping on test. Brier and log loss assess overall probability
+quality as well as calibration, as explained in the
+[scikit-learn calibration guide](https://scikit-learn.org/stable/modules/calibration.html).
+
+For related images, supply --group_key patient_id (or slide_id/video_id) if that
+field exists in saved records. Alternatively, --group_file groups.json reads:
+
+~~~json
+{
+  "dsb2018": {
+    "val": {"case_val_001": "patient_A", "case_val_002": "patient_A"},
+    "test": {"case_test_001": "patient_B", "case_test_002": "patient_B"}
+  }
+}
+~~~
+
+The mapping must cover every analyzed image. The script checks group independence
+across the supplied splits; it does not create or repair dataset splits.
+With groups, validation CV keeps whole groups together and confidence intervals
+use a cluster bootstrap (--bootstrap_samples 1000, --seed 42). Without groups,
+95% Wilson intervals assume independent images. Bins containing fewer than two
+independent groups have null interval bounds rather than misleading precision.
+These intervals describe test-sampling uncertainty conditional on the fitted
+mapping and fixed bin boundaries; they do not include uncertainty from refitting
+the calibration mapping.
+
+Run the statistical and file-format regression tests with:
+
+~~~powershell
+python -m unittest discover -s tests -p "test_calibration.py" -v
+~~~
